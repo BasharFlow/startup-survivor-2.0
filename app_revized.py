@@ -7,7 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
 # Startup Survivor RPG (Gemini) - Tek Dosya
-# Web SaaS odaklı simülasyon + oyun modları
+# - Fikri analiz eder, hikayeleştirir
+# - Her tur KRİZ'i açıkça yazar
+# - Seçenekler krize çözüm odaklı, uzun ve uygulanabilir olur
+# - Extreme: absürt ama çözme ihtimali olan seçenekler
 # ============================================================
 
 st.set_page_config(page_title="Startup Survivor RPG", page_icon="💀", layout="wide")
@@ -63,12 +66,15 @@ def apply_custom_css(selected_mode: str) -> None:
             margin: 0;
         }}
         .hero-subtitle {{ font-size: 1.05rem; color: #bbb; font-weight: 300; margin-top: 6px; }}
-
+        .crisis-badge {{
+            display:inline-block; padding:6px 10px; border-radius:10px;
+            border:1px solid #333; background:#0b0f14; color:#ddd;
+            margin: 6px 0 10px 0;
+        }}
         .expense-row {{ display: flex; justify-content: space-between; font-size: 0.9rem; color: #ccc; margin-bottom: 5px; }}
         .expense-label {{ font-weight: bold; }}
         .expense-val {{ color: #e74c3c; }}
         .total-expense {{ border-top: 1px solid #444; margin-top: 5px; padding-top: 5px; font-weight: bold; color: #e74c3c; }}
-
         .chip {{
             display:inline-block; padding:4px 10px; border-radius:999px;
             border:1px solid #333; margin-right:6px; margin-bottom:6px; font-size:0.85rem; color:#ddd;
@@ -209,7 +215,6 @@ def apply_chance_card(stats: Dict[str, Any], card: Dict[str, Any], mode: str) ->
     raw_val = int(card.get("val", 0))
     val = int(round(raw_val * shock))
 
-    # Uçları kırp (Extreme biraz daha geniş)
     if effect == "money":
         abs_cash = max(1, int(abs(stats.get("money", 0))))
         cap_ratio = 0.50 if mode != "Extreme" else 1.25
@@ -248,10 +253,9 @@ def simulate_saas_kpis(stats: Dict[str, Any], player: Dict[str, Any], mode: str,
     activation = clamp_float(stats.get("activation", 0.35), 0.05, 0.90, 0.35)
     conversion = clamp_float(stats.get("conversion", 0.04), 0.001, 0.40, 0.04)
 
-    # Intent -> metriklere küçük dokunuş (kural tabanlı)
     if intent == "growth":
         activation = clamp_float(activation + 0.02 * marketing_skill, 0.05, 0.90, activation)
-        churn = clamp_float(churn + 0.01, 0.01, 0.60, churn)  # agresif büyüme bazen kaliteyi zorlar
+        churn = clamp_float(churn + 0.01, 0.01, 0.60, churn)
     elif intent == "product":
         retention = clamp_float(retention + 0.03 * coding_skill, 0.20, 0.98, retention)
         churn = clamp_float(churn - 0.01, 0.01, 0.60, churn)
@@ -260,7 +264,6 @@ def simulate_saas_kpis(stats: Dict[str, Any], player: Dict[str, Any], mode: str,
     elif intent == "team_ops":
         churn = clamp_float(churn - 0.005, 0.01, 0.60, churn)
 
-    # CAC
     base_cac = clamp_int(stats.get("cac", 35), 5, 500, 35)
     if mode == "Zor":
         base_cac = int(base_cac * 1.15)
@@ -309,7 +312,7 @@ def simulate_saas_kpis(stats: Dict[str, Any], player: Dict[str, Any], mode: str,
     }
 
 # ------------------------------
-# KRİZ TESPİTİ (Seçenekleri kriz odaklı yaptırmak için)
+# KRİZ TESPİTİ (KRİZ METNİ HER TUR GÖRÜNSÜN)
 # ------------------------------
 def detect_crisis(stats: Dict[str, Any], expenses_total: int) -> Dict[str, Any]:
     money = int(stats.get("money", 0))
@@ -320,33 +323,39 @@ def detect_crisis(stats: Dict[str, Any], expenses_total: int) -> Dict[str, Any]:
     motivation = int(stats.get("motivation", 50))
     team = int(stats.get("team", 50))
 
-    burn = max(0, expenses_total - mrr)  # aylık net yanma
+    burn = max(0, expenses_total - mrr)
     runway_months = 999
     if burn > 0:
         runway_months = max(0, money // burn)
 
     issues = []
     if burn > 0 and runway_months <= 3:
-        issues.append(("RUNWAY", "Kasa hızlı eriyor (runway çok kısa)."))
+        issues.append(("RUNWAY", f"Kasa hızlı eriyor: yaklaşık {runway_months} ay yetecek gibi."))
     if churn >= 0.14:
-        issues.append(("CHURN", "Kullanıcılar hızlı bırakıyor (churn yüksek)."))
+        issues.append(("CHURN", "Kullanıcılar hızlı bırakıyor: bırakma oranı yüksek."))
     if activation <= 0.22:
-        issues.append(("ACTIVATION", "Yeni gelenler ürünü yeterince kullanmıyor (aktivasyon düşük)."))
+        issues.append(("ACTIVATION", "Yeni gelenler ürünü yeterince kullanmıyor: ilk deneyim zayıf."))
     if conversion <= 0.02 and stats.get("active_users", 0) > 300:
-        issues.append(("CONVERSION", "Aktif kullanıcı var ama ödeyen az (ödeme dönüşümü düşük)."))
+        issues.append(("CONVERSION", "Aktif kullanıcı var ama ödeyen az: ücretli geçiş zayıf."))
     if motivation <= 25:
-        issues.append(("MORALE", "Ekip morali düşüyor (motivasyon kritik)."))
+        issues.append(("MORALE", "Ekip morali kritik seviyede: motivasyon çok düşük."))
     if team <= 15:
-        issues.append(("CAPACITY", "Ekip çok küçük, yetişememe riski var."))
+        issues.append(("CAPACITY", "Ekip kapasitesi düşük: yetişememe riski büyüyor."))
 
     if not issues:
-        issues.append(("BALANCE", "Şimdilik dengedesin; bir sonraki sıçrama için doğru hamle önemli."))
+        issues.append(("BALANCE", "Şimdilik dengedesin; ama bir sonraki ay küçük bir hata büyük dalga yaratabilir."))
 
-    # birincil kriz = ilk eleman (öncelik sırası yukarıdaki sıraya göre)
     primary_code, primary_text = issues[0]
+
+    # “kriz satırı” kullanıcıya net görünsün
+    crisis_line = f"KRİZ: {primary_text} (Gider {format_currency(expenses_total)} | MRR {format_currency(mrr)} | Kasa {format_currency(money)})"
+    if burn > 0:
+        crisis_line += f" | Net yanma ~{format_currency(burn)}"
+
     return {
         "primary_code": primary_code,
         "primary_text": primary_text,
+        "crisis_line": crisis_line,
         "runway_months": int(runway_months),
         "burn": int(burn),
         "all": issues,
@@ -408,10 +417,7 @@ def call_gemini(prompt: str, history: List[Dict[str, Any]]) -> Optional[str]:
                 continue
 
     if last_err:
-        st.warning(
-            "AI isteği başarısız oldu (quota/model/ağ). Offline anlatıcıyla devam ediyorum.\n\n"
-            f"Hata: {last_err}"
-        )
+        st.warning("AI isteği başarısız oldu. Offline anlatıcıyla devam ediyorum.\n\n" f"Hata: {last_err}")
     return None
 
 # ------------------------------
@@ -419,19 +425,36 @@ def call_gemini(prompt: str, history: List[Dict[str, Any]]) -> Optional[str]:
 # ------------------------------
 def validate_ai_payload(resp: Any) -> Dict[str, Any]:
     if not isinstance(resp, dict):
-        return {"text": "AI cevabı okunamadı. Lütfen tekrar dene.", "insights": [], "choices": [], "next": {}}
+        return {
+            "text": "AI cevabı okunamadı. Lütfen tekrar dene.",
+            "crisis_line": "",
+            "idea_analysis": [],
+            "insights": [],
+            "choices": [],
+            "next": {},
+        }
 
     text = resp.get("text", "")
+    crisis_line = resp.get("crisis_line", "")
+    idea_analysis = resp.get("idea_analysis", [])
     insights = resp.get("insights", [])
     choices = resp.get("choices", [])
     nxt = resp.get("next", {})
 
     if not isinstance(text, str):
         text = str(text)
+    if not isinstance(crisis_line, str):
+        crisis_line = str(crisis_line)
+
+    if not isinstance(idea_analysis, list):
+        idea_analysis = []
+    idea_analysis = [str(x) for x in idea_analysis][:6]
+
     if not isinstance(insights, list):
         insights = []
     insights = [str(x) for x in insights][:6]
 
+    # choices: daha dolu bir şema
     norm_choices = []
     if isinstance(choices, list):
         for c in choices[:2]:
@@ -442,9 +465,27 @@ def validate_ai_payload(resp: Any) -> Dict[str, Any]:
                 steps = c.get("steps", [])
                 if not isinstance(steps, list):
                     steps = []
-                steps = [str(s).strip() for s in steps][:4]
+                steps = [str(s).strip() for s in steps][:5]
+                expected = c.get("expected", [])
+                if not isinstance(expected, list):
+                    expected = []
+                expected = [str(e).strip() for e in expected][:4]
+                risks = c.get("risks", [])
+                if not isinstance(risks, list):
+                    risks = []
+                risks = [str(r).strip() for r in risks][:4]
+
                 if title or desc:
-                    norm_choices.append({"id": cid, "title": title, "desc": desc, "steps": steps})
+                    norm_choices.append(
+                        {
+                            "id": cid,
+                            "title": title,
+                            "desc": desc,
+                            "steps": steps,
+                            "expected": expected,
+                            "risks": risks,
+                        }
+                    )
     choices = norm_choices
 
     if not isinstance(nxt, dict):
@@ -455,62 +496,232 @@ def validate_ai_payload(resp: Any) -> Dict[str, Any]:
         "motivation_delta": nxt.get("motivation_delta", 0),
     }
 
-    return {"text": text, "insights": insights, "choices": choices, "next": normalized_next}
+    return {
+        "text": text,
+        "crisis_line": crisis_line,
+        "idea_analysis": idea_analysis,
+        "insights": insights,
+        "choices": choices,
+        "next": normalized_next,
+    }
 
-def offline_intro_payload(mode: str, idea_short: str) -> Dict[str, Any]:
-    # başlangıçta Ay 1 için "karar sorusu" (hesap yok)
+# ------------------------------
+# INTRO (FİKRİ ANALİZ + HİKAYE + KRİZİ YAZDIR)
+# ------------------------------
+def build_intro_prompt(mode: str, idea_full: str, char_desc: str, stats: Dict[str, Any]) -> str:
+    tone = MODE_PROFILES.get(mode, MODE_PROFILES["Gerçekçi"])["tone"]
+    idea_short = " ".join((idea_full or "").strip().split()[:8]) or "Startup"
+
+    return f"""
+ROLÜN: Startup simülasyonu anlatıcısı + ürün koçu.
+MOD: {mode} (ton: {tone})
+
+GÖREV: Kullanıcının yazdığı fikri ANALİZ ET, YORUMLA ve OYUNU HİKAYELEŞTİR.
+- Bu kısım sadece "başladı" demesin; fikrin güçlü/zayıf yanlarını, varsayımları ve riskleri anlat.
+- Çok teknik terim kullanma. Mecbur kalırsan parantez içinde basitçe açıkla.
+- 1. ayın başında küçük bir "KRİZ/GERGİNLİK" üret (ör: belirsiz hedef kitle, karmaşık MVP, kullanıcı akışı, vb.). Extreme modda komik ama gerçek bir problem doğsun.
+
+FİKİR:
+Kısa ad: {idea_short}
+Detay: {idea_full}
+
+KARAKTER:
+{char_desc}
+
+BAŞLANGIÇ DURUMU:
+Kasa: {int(stats.get("money",0))} TL
+Ekip: {int(stats.get("team",50))}/100
+Motivasyon: {int(stats.get("motivation",50))}/100
+Aylık pazarlama: {int(stats.get("marketing_cost",5000))} TL
+Fiyat: {int(stats.get("price",99))} TL
+
+İSTENEN JSON (SADECE JSON):
+{{
+  "crisis_line": "KRİZ: ...",
+  "idea_analysis": [
+    "Fikir özeti (1 cümle)",
+    "Hedef kullanıcı (basit anlat)",
+    "Değer önerisi (neden kullanırlar?)",
+    "En büyük risk (1 cümle)",
+    "İlk 30 gün hedefi (ölçülebilir)",
+    "En kritik varsayım (test etmen gereken)"
+  ],
+  "text": "Ay 1 hikaye anlatımı (6-10 cümle). Fikri aynen kopyalama; yorumla ve sahne kur.",
+  "insights": ["Bu ay odak", "Bu ay ölçüm", "Bu ay risk"],
+  "choices": [
+    {{
+      "id":"A",
+      "title":"(Kısa başlık)",
+      "desc":"(4-6 cümle) Bu krizi nasıl çözer? Ne yapacaksın? Neyi değiştireceksin? Neden işe yarar?",
+      "steps":["1) ...","2) ...","3) ...","4) ..."],
+      "expected":["Beklenen 1","Beklenen 2","Beklenen 3"],
+      "risks":["Risk 1","Risk 2"]
+    }},
+    {{
+      "id":"B",
+      "title":"(Kısa başlık)",
+      "desc":"(4-6 cümle) A'dan farklı yaklaşım; daha sağlam veya daha hızlı.",
+      "steps":["1) ...","2) ...","3) ...","4) ..."],
+      "expected":["Beklenen 1","Beklenen 2","Beklenen 3"],
+      "risks":["Risk 1","Risk 2"]
+    }}
+  ],
+  "next": {{"marketing_cost": null, "team_delta": 0, "motivation_delta": 0}}
+}}
+""".strip()
+
+def offline_intro_payload(mode: str, idea_full: str) -> Dict[str, Any]:
+    idea_short = " ".join((idea_full or "").strip().split()[:8]) or "Startup"
     if mode == "Extreme":
-        text = f"Ay 1: {idea_short} sahneye çıkıyor. Evren saçmalamak için hazır. İlk hamlen ne?"
+        crisis_line = "KRİZ: Her şey çok iddialı; ama kimin ne için kullanacağı belirsiz. Evren bunu fırsat bulup karıştırmaya hazır."
+        text = (
+            f"Ay 1 — {idea_short} sahneye çıktı ama bir sorun var: fikir çok güçlü, yönü bulanık.\n"
+            "İnsanlar 'tam olarak neyi çözüyor' diye soruyor. Üstelik ilk kullanıcı akışında iki adım fazla var; kimse sabretmiyor.\n"
+            "Sen bunu düzeltmezsen, büyüme değil kaos büyüyecek. Peki ilk hamlen ne?"
+        )
         choices = [
             {
                 "id": "A",
-                "title": "Deli Cesaretiyle Lansman",
-                "desc": "Hızlı bir demo yayınla, insanlardan geri bildirim topla. Risk: ortalık bug dolabilir.",
-                "steps": ["Mini demo hazırla", "10 kişiye test ettir", "En çok şikayeti not al"],
+                "title": "Absürt Ama Net: Tek Cümlelik Vaad",
+                "desc": "Krizi çözmenin yolu netlik: ürünün ne olduğunu tek cümleye indir. Extreme modda bunu komik bir meydan okumaya çevir: "
+                        "kullanıcıya 10 saniyelik 'anladım' testi yap. Sonra ilk akışı 2 adıma düşür. Böylece belirsizliği kırarsın.",
+                "steps": ["1) Vaadi tek cümle yaz", "2) 10 kişiyle 10 saniye testi yap", "3) İlk akışı 2 adıma indir", "4) En çok takıldıkları yeri düzelt"],
+                "expected": ["İlk kullanım artar", "Mesajın netleşir", "Zayıf noktayı hızlı görürsün"],
+                "risks": ["Aşırı sadeleştirip değeri küçültmek", "Komik anlatımın yanlış anlaşılması"],
             },
             {
                 "id": "B",
                 "title": "Kaos Öncesi Emniyet Kemeri",
-                "desc": "En kritik hataları önle, sonra büyü. Risk: büyüme yavaşlar ama sağlam başlarsın.",
-                "steps": ["En kritik akışı seç", "Çökme riskini azalt", "Basit onboarding ekle"],
+                "desc": "Belirsizlik krizi genelde kötü ilk deneyimle birleşir. Önce en kritik hatayı seç: kullanıcı neden vazgeçiyor? "
+                        "İlk akışa minik bir rehber ekle, ardından bir ölçüm koy (nerede bırakıyorlar?). Extreme evreni eğlenceli kalsın ama "
+                        "temeli sağlamlaştır.",
+                "steps": ["1) En kritik akışı seç", "2) Basit rehber/ipuçları ekle", "3) Bırakma noktasını ölç", "4) En çok bıraktıkları adımı düzelt"],
+                "expected": ["Daha stabil deneyim", "Vazgeçme azalır", "Sonraki ay büyüme zemini oluşur"],
+                "risks": ["Büyüme gecikebilir", "İyileştirme hedefi dağılabilir"],
             },
         ]
     else:
-        text = f"Ay 1: {idea_short} için ilk ay başladı. İlk hamlen ne olacak?"
+        crisis_line = "KRİZ: Fikir değerli ama ilk kullanıcı için 'neden şimdi?' sorusu net değil. İlk ay netlik ve ilk deneyim şart."
+        text = (
+            f"Ay 1 — {idea_short} ile oyuna girdin. Fikirin potansiyeli yüksek; ama ilk kullanıcı senin kafandaki resmi görmüyor.\n"
+            "İnsanlar bir dakikada anlamazsa çıkıp gidiyor. Bu ayın görevi: neyi kimin için çözdüğünü netleştirip ilk deneyimi pürüzsüz yapmak.\n"
+            "Bunu başarırsan sonraki ay büyüme konuşuruz."
+        )
         choices = [
             {
                 "id": "A",
-                "title": "Hızlı Lansman + Geri Bildirim",
-                "desc": "Basit bir sürüm çıkarıp gerçek kullanıcıdan öğren. Risk: eksikler görünür.",
-                "steps": ["MVP'yi daralt", "10–20 test kullanıcısı bul", "En büyük sorunu seç"],
+                "title": "Netlik + Hızlı Deneme",
+                "desc": "Krizin kökü netlik: hedef kullanıcı ve vaadi keskinleştir. 10-20 kişilik küçük deneme yapıp ilk 5 dakikada nerede zorlandıklarını izle. "
+                        "Sonra sadece o noktayı düzelt. Böylece fikri ‘gerçek hayatta’ test etmiş olursun.",
+                "steps": ["1) Hedef kullanıcıyı seç", "2) Vaadi tek cümle yaz", "3) 10-20 deneme kullanıcı bul", "4) En büyük tıkanıklığı düzelt"],
+                "expected": ["Fikir netleşir", "İlk deneyim iyileşir", "Gerçek geri bildirim toplanır"],
+                "risks": ["Yanlış kullanıcı grubunu seçmek", "Çok şey denemeye çalışmak"],
             },
             {
                 "id": "B",
-                "title": "Ürünü Sağlamlaştır",
-                "desc": "Önce deneyimi ve temel kaliteyi iyileştir. Risk: büyüme biraz gecikir.",
-                "steps": ["Onboarding'i iyileştir", "Hata/performansı düzelt", "Kısa yol haritası çıkar"],
+                "title": "İlk Deneyimi Güçlendir",
+                "desc": "Krizin kökü ‘ilk kullanım’. Kullanıcıya bir dakikada değer göster: basit onboarding ve örnek senaryo. "
+                        "Bu ay amaç büyüme değil; ‘kullanıcı kalıyor mu?’ sorusuna cevap almak.",
+                "steps": ["1) İlk 1 dakikayı tasarla", "2) 1 örnek senaryo ekle", "3) Basit rehber yaz", "4) Nerede bırakıyorlar ölç"],
+                "expected": ["Vazgeçme azalır", "Kullanıcı daha çok dener", "Sonraki ay büyümeye hazır olursun"],
+                "risks": ["Mükemmelliyetçilik", "Ölçüm koymadan 'iyi oldu' sanmak"],
             },
         ]
-    return {"text": text, "insights": ["Hedef seç: ya öğrenme ya kalite.", "İlk ayda en büyük kazanım: doğru problemi bulmak.", "Küçük, ölçülebilir bir hedef koy."], "choices": choices, "next": {}}
 
-def offline_turn_payload(mode: str, month: int, crisis: Dict[str, Any], stats: Dict[str, Any], expenses_total: int) -> Dict[str, Any]:
-    ctext = crisis["primary_text"]
-    text = (
-        f"Ay {month}: {ctext}\n\n"
-        f"Bu ay gider: {format_currency(expenses_total)} | MRR: {format_currency(int(stats.get('mrr',0)))} | "
-        f"Kasa: {format_currency(int(stats.get('money',0)))}"
-    )
-    if mode == "Extreme":
-        choices = [
-            {"id": "A", "title": "Sorunu Çözen Saçmalık (Ama Mantıklı)", "desc": "Absürt bir kampanya ile geri dönüş al. Risk: itibar sallanır.", "steps": ["Komik ama net mesaj", "Küçük deneme", "Sonuca göre büyüt"]},
-            {"id": "B", "title": "Daha Az Saçmalık, Daha Çok Çözüm", "desc": "Kök sebebi düzelt. Risk: hemen büyüme bekleme.", "steps": ["Kök sebebi seç", "1 kritik düzeltme", "Ölç ve doğrula"]},
-        ]
-    else:
-        choices = [
-            {"id": "A", "title": "Hızlı İyileştirme", "desc": "Kriz kaynağını hızlı yamala ve ölç. Risk: geçici çözüm olabilir.", "steps": ["En büyük sorun", "Hızlı düzelt", "Ölçüm ekle"]},
-            {"id": "B", "title": "Kalıcı Çözüm", "desc": "Kriz kökünü çözmek için ürün ve süreç kur. Risk: zaman alır.", "steps": ["Kök analiz", "Kalıcı değişim", "Takip metriği"]},
-        ]
-    return {"text": text, "insights": ["Krizi bir metrikle tarif et.", "Bir hamle = bir hedef.", "Ölçmezsen öğrenemezsin."], "choices": choices, "next": {}}
+    return {
+        "crisis_line": crisis_line,
+        "idea_analysis": [
+            f"Özet: {idea_short}",
+            "Hedef kullanıcıyı 1 gruba indir (ilk ay).",
+            "Değer önerisini tek cümleye indir.",
+            "Risk: çok geniş kapsam / belirsiz yön.",
+            "30 gün hedefi: 'ilk değer anı' (1 dakikada).",
+            "Varsayım: insanlar bunu gerçekten şimdi ister mi?",
+        ],
+        "text": text,
+        "insights": ["Bu ay odak: netlik + ilk deneyim", "Bu ay ölçüm: nerede bırakıyorlar?", "Bu ay risk: kapsamı büyütme"],
+        "choices": choices,
+        "next": {"marketing_cost": None, "team_delta": 0, "motivation_delta": 0},
+    }
+
+# ------------------------------
+# TUR PROMPT (KRİZ + ÇÖZÜM ODAKLI, UZUN SEÇENEKLER)
+# ------------------------------
+def build_turn_prompt(
+    *,
+    mode: str,
+    month: int,
+    user_move: str,
+    crisis: Dict[str, Any],
+    stats: Dict[str, Any],
+    expenses_total: int,
+    chance_text: str,
+    char_desc: str,
+    idea_short: str,
+    idea_full: str,
+) -> str:
+    tone = MODE_PROFILES.get(mode, MODE_PROFILES["Gerçekçi"])["tone"]
+    return f"""
+ROLÜN: Startup simülasyonu anlatıcısı + kriz çözüm koçu.
+MOD: {mode} (ton: {tone})
+AY: {month}
+
+KURAL-1: "text" içinde fikri baştan kopyalama. Yorumla + hikayeleştir.
+KURAL-2: Krizi mutlaka açıkça yaz. "crisis_line" alanı dolu olsun.
+KURAL-3: Seçenekler, krizi çözme ihtimali olan gerçek aksiyonlar içermeli.
+KURAL-4: Seçenekler basit 1-2 cümle olmasın; 4-6 cümle ve uygulanabilir plan istiyorum.
+KURAL-5: Extreme modda komik/absürt olabilir ama yine de çözmeye çalışmalı.
+KURAL-6: Terimleri azalt. Mecbur kalırsan parantezle basit açıkla.
+
+{char_desc}
+
+GİRİŞİM:
+Kısa ad: {idea_short}
+Detay: {idea_full}
+
+BU AYIN GERÇEK DURUMU (değiştirme):
+- Kasa: {int(stats.get("money",0))} TL
+- Gider: {int(expenses_total)} TL
+- MRR: {int(stats.get("mrr",0))} TL
+- Aktif: {int(stats.get("active_users",0))}
+- Ödeyen: {int(stats.get("paid_users",0))}
+- Churn: {round(float(stats.get("churn",0))*100,1)}%
+{chance_text}
+
+KRİZ (Python tespiti):
+- Ana kriz: {crisis["primary_text"]}
+- Runway (ay): {crisis["runway_months"]}
+- Net yanma: {crisis["burn"]} TL
+
+Oyuncunun hamlesi:
+{user_move}
+
+İSTENEN JSON (SADECE JSON):
+{{
+  "crisis_line": "KRİZ: ... (gider/mrr/kasa/yanma gibi kısa özetle)",
+  "text": "Bu ay ne oldu? 8-12 cümle. Hikaye gibi ama gerçekçi, fikri yorumla.",
+  "insights": ["1) Krizin gerçek karşılığı", "2) Bu ay öğrenilen ders", "3) Bir sonraki risk"],
+  "choices": [
+    {{
+      "id":"A",
+      "title":"(Kısa başlık)",
+      "desc":"(4-6 cümle) Krize nasıl müdahale eder? Hangi sorunu hedefler? Neden işe yarayabilir?",
+      "steps":["1) ...","2) ...","3) ...","4) ...","5) ..."],
+      "expected":["Beklenen etki 1","Beklenen etki 2","Beklenen etki 3"],
+      "risks":["Risk 1","Risk 2","Risk 3"]
+    }},
+    {{
+      "id":"B",
+      "title":"(Kısa başlık)",
+      "desc":"(4-6 cümle) A'dan farklı yaklaşım; daha kalıcı veya daha hızlı.",
+      "steps":["1) ...","2) ...","3) ...","4) ...","5) ..."],
+      "expected":["Beklenen etki 1","Beklenen etki 2","Beklenen etki 3"],
+      "risks":["Risk 1","Risk 2","Risk 3"]
+    }}
+  ],
+  "next": {{"marketing_cost": null, "team_delta": 0, "motivation_delta": 0}}
+}}
+""".strip()
 
 # ------------------------------
 # AYARLAR PANELİ (SAĞ ÜST)
@@ -575,89 +786,7 @@ def render_settings_panel(game_started: bool) -> None:
             st.caption(f"🔸 **{t.get('title','')}**: {t.get('desc','')}")
 
 # ------------------------------
-# AI: KRİZ-ODAKLI SEÇENEK ÜRET (Terimsiz, çözüm odaklı)
-# ------------------------------
-def build_choices_prompt(
-    *,
-    mode: str,
-    month: int,
-    user_move: str,
-    crisis: Dict[str, Any],
-    stats: Dict[str, Any],
-    expenses_total: int,
-    chance_text: str,
-    char_desc: str,
-    idea_short: str,
-    idea_full: str,
-) -> str:
-    tone = MODE_PROFILES.get(mode, MODE_PROFILES["Gerçekçi"])["tone"]
-
-    # Jargon azaltma kuralı: terim kullanırsa parantezle açıklasın
-    # Seçenekler kriz çözsün: "ne yapacaksın + nasıl + beklenen etki"
-    # Extreme: absürt ama işe yarayabilir
-    return f"""
-ROLÜN: Startup simülasyonu anlatıcısı + kriz koçu.
-MOD: {mode} (ton: {tone})
-AY: {month}
-
-KURAL-1: "text" içinde fikri BİREBİR uzun uzun tekrar etme. Sadece kısa ad ile referans ver: {idea_short}
-KURAL-2: Çok teknik/iş terimi kullanma. Mecbur kalırsan parantez içinde basitçe açıkla.
-KURAL-3: Bu turdaki seçenekler MUTLAKA şu anki krizi çözmeye çalışmalı. "Süs" seçenek olmasın.
-KURAL-4: Extreme modda seçenekler absürt olabilir ama yine de sorunu çözme ihtimali olmalı (komik ama işe yarayabilir).
-KURAL-5: Diğer modlarda seçenekler gerçek hayatta uygulanabilir, mantıklı olmalı.
-
-{char_desc}
-
-GİRİŞİM (özet):
-Kısa ad: {idea_short}
-Detay: {idea_full}
-
-BU TUR RAPORU (Python hesapladı, değiştirme):
-- Kasa: {int(stats.get("money",0))} TL
-- Gider: {int(expenses_total)} TL
-- MRR (aylık gelir): {int(stats.get("mrr",0))} TL
-- Aktif kullanıcı: {int(stats.get("active_users",0))}
-- Ödeyen: {int(stats.get("paid_users",0))}
-- Churn (bırakma): {round(float(stats.get("churn",0))*100,1)}%
-{chance_text}
-
-KRİZ:
-- Ana kriz: {crisis["primary_text"]}
-- Runway (ay): {crisis["runway_months"]}
-- Aylık net yanma (yaklaşık): {crisis["burn"]} TL
-
-Oyuncunun hamlesi:
-{user_move}
-
-İSTENEN ÇIKTI:
-- "text": Bu ay ne oldu? Krizi hikaye gibi anlat ama kısa ve net.
-- "insights": 3 madde: (1) Krizin gerçek hayatta karşılığı, (2) kısa vadede yapılacak, (3) dikkat edilecek risk
-- "choices": 2 seçenek:
-    A) Krize hızlı çözüm (hızlı etkili ama riskli olabilir)
-    B) Krize kalıcı çözüm (daha yavaş ama sağlam)
-  Her choice şunları içersin:
-    - title: kısa başlık
-    - desc: 2-3 cümlelik açıklama (krizi nasıl çözer?)
-    - steps: 3 maddelik mini plan (kısa, anlaşılır)
-- "next": küçük öneriler:
-    - marketing_cost: (opsiyonel) yeni pazarlama bütçesi öner
-    - team_delta: -5..+5
-    - motivation_delta: -5..+5
-
-SADECE JSON DÖN:
-{{
-  "text": "...",
-  "insights": ["...", "...", "..."],
-  "choices": [
-    {{"id":"A","title":"...","desc":"...","steps":["...","...","..."]}},
-    {{"id":"B","title":"...","desc":"...","steps":["...","...","..."]}}
-  ],
-  "next": {{"marketing_cost": null, "team_delta": 0, "motivation_delta": 0}}
-}}
-""".strip()
-
-# ------------------------------
-# TUR İŞLEME (Ay 1, Ay 2 ...)
+# TUR İŞLEME
 # ------------------------------
 def run_turn(user_move: str) -> Dict[str, Any]:
     mode = st.session_state.selected_mode
@@ -665,21 +794,20 @@ def run_turn(user_move: str) -> Dict[str, Any]:
     player = st.session_state.player
     month = int(st.session_state.month)
 
-    # 1) Giderleri düş
+    # 1) gider düş
     salary, server, marketing, total_exp = calculate_expenses(stats, month, mode)
     stats["money"] = int(stats.get("money", 0) - total_exp)
     st.session_state.expenses = {"salary": salary, "server": server, "marketing": marketing, "total": total_exp}
 
-    # 2) Hamle niyetini çıkar (KPI simüle ederken kullanacağız)
+    # 2) niyet
     intent = detect_intent(user_move)
 
-    # 3) KPI simülasyonu -> MRR hesapla (gelir ekle)
-    kpi_summary = simulate_saas_kpis(stats, player, mode, intent)
+    # 3) KPI -> MRR -> kasa
+    simulate_saas_kpis(stats, player, mode, intent)
     stats["money"] = int(stats.get("money", 0) + int(stats.get("mrr", 0)))
-
     clamp_core_stats(stats)
 
-    # 4) Şans kartı
+    # 4) şans kartı
     card = trigger_chance_card(mode)
     st.session_state.last_chance_card = card
     chance_text = ""
@@ -687,15 +815,15 @@ def run_turn(user_move: str) -> Dict[str, Any]:
         chance_text, _ = apply_chance_card(stats, card, mode)
         clamp_core_stats(stats)
 
-    # 5) Kriz tespit et (Seçenekleri kriz odaklı yaptıracağız)
+    # 5) kriz
     crisis = detect_crisis(stats, total_exp)
 
-    # 6) AI prompt
+    # 6) AI
     char_desc = build_character_desc(player)
     idea_full = st.session_state.startup_idea
-    idea_short = " ".join((idea_full or "").strip().split()[:6]) or "Startup"
+    idea_short = " ".join((idea_full or "").strip().split()[:8]) or "Startup"
 
-    prompt = build_choices_prompt(
+    prompt = build_turn_prompt(
         mode=mode,
         month=month,
         user_move=user_move,
@@ -708,7 +836,6 @@ def run_turn(user_move: str) -> Dict[str, Any]:
         idea_full=idea_full,
     )
 
-    # AI call
     raw = call_gemini(prompt, st.session_state.model_history)
     data = None
     if raw:
@@ -718,11 +845,55 @@ def run_turn(user_move: str) -> Dict[str, Any]:
             data = None
 
     if data is None:
-        data = offline_turn_payload(mode, month, crisis, stats, total_exp)
+        # Offline: yine krizi yazalım + seçenekleri uzun tutalım
+        data = {
+            "crisis_line": crisis["crisis_line"],
+            "text": f"Ay {month}: {idea_short} için bu ayın ana konusu: {crisis['primary_text']}. "
+                    f"Bu ay giderin {format_currency(total_exp)}, MRR {format_currency(int(stats.get('mrr',0)))}. "
+                    f"Şimdi odaklanmazsan, bir sonraki ay bu küçük dalga büyüyebilir.",
+            "insights": [
+                "Krizi tek cümleyle tanımla ve herkesin anladığından emin ol.",
+                "Bir hamle seç: ya hızlı sonuç ya kalıcı çözüm.",
+                "Ölçüm koymadan 'iyileşti' diyemezsin.",
+            ],
+            "choices": [
+                {
+                    "id": "A",
+                    "title": "Hızlı Müdahale (Hızlı Etki)",
+                    "desc": "Bu krizi hızlıca hafifletmek için tek bir dar boğaza odaklan. Kullanıcının vazgeçtiği noktayı bul, "
+                            "orayı basitleştir ve 1 hafta içinde tekrar test et. Hızlı etki alırsın ama kalıcı olmayabilir.",
+                    "steps": [
+                        "1) En çok vazgeçilen adımı tespit et",
+                        "2) O adımı yarıya indir (daha az adım)",
+                        "3) 10 kullanıcıyla tekrar dene",
+                        "4) Tek bir düzeltmeyi yayına al",
+                        "5) Sonuçları 3 gün izle",
+                    ],
+                    "expected": ["Vazgeçme azalır", "Daha net geri bildirim", "Kısa vadede moral artışı"],
+                    "risks": ["Geçici çözüm", "Yanlış yere odaklanma", "Aynı ayda çok şey değiştirme"],
+                },
+                {
+                    "id": "B",
+                    "title": "Kök Sebep (Kalıcı Çözüm)",
+                    "desc": "Krizin kökünü çözmek için temel akışı yeniden tasarla: kim için, hangi ana iş, hangi tek sonuç? "
+                            "Bunu netleştirip ardından ölçüm ve düzenli takip ekle. Daha yavaş ama daha sağlam ilerlersin.",
+                    "steps": [
+                        "1) Hedef kullanıcıyı tek gruba indir",
+                        "2) Vaadi tek cümle yap",
+                        "3) İlk 1 dakikayı yeniden tasarla",
+                        "4) Ölçüm ekle (nerede bırakıyorlar?)",
+                        "5) 2 hafta boyunca aynı hedefe odaklan",
+                    ],
+                    "expected": ["Netlik artar", "Daha stabil büyüme zemini", "Gelecek ay daha iyi kararlar"],
+                    "risks": ["Yavaş hissettirebilir", "Ekip sabırsızlanabilir", "Netlik zorlayıcı olabilir"],
+                },
+            ],
+            "next": {"marketing_cost": None, "team_delta": 0, "motivation_delta": 0},
+        }
 
     ai = validate_ai_payload(data)
 
-    # Next önerileri: kontrollü uygula (küçük)
+    # 7) küçük next önerileri
     nxt = ai.get("next", {}) or {}
     if isinstance(nxt, dict):
         nm = nxt.get("marketing_cost", None)
@@ -734,7 +905,7 @@ def run_turn(user_move: str) -> Dict[str, Any]:
         stats["motivation"] = int(stats.get("motivation", 50) + md)
         clamp_core_stats(stats)
 
-    # Game over (Python)
+    # 8) game over
     if stats.get("money", 0) < 0 or stats.get("team", 0) <= 0 or stats.get("motivation", 0) <= 0:
         st.session_state.game_over = True
         if stats.get("money", 0) < 0:
@@ -744,45 +915,51 @@ def run_turn(user_move: str) -> Dict[str, Any]:
         else:
             st.session_state.game_over_reason = "Motivasyon sıfırlandı."
 
-    # UI history: AI mesajını ekle
-    st.session_state.ui_history.append({
-        "role": "assistant",
-        "text": ai.get("text", ""),
-        "insights": ai.get("insights", []),
-    })
+    # 9) chat history'ye AI mesajı
+    st.session_state.ui_history.append(
+        {
+            "role": "assistant",
+            "crisis_line": ai.get("crisis_line", crisis.get("crisis_line", "")),
+            "idea_analysis": ai.get("idea_analysis", []),
+            "text": ai.get("text", ""),
+            "insights": ai.get("insights", []),
+        }
+    )
 
-    # Model history (temiz metin)
+    # 10) model history
     st.session_state.model_history.append({"role": "user", "parts": [user_move]})
     st.session_state.model_history.append({"role": "model", "parts": [ai.get("text", "")]})
 
-    # Seçenekleri sakla
+    # 11) seçenekleri sakla
     st.session_state.last_choices = ai.get("choices", []) or []
 
-    # Ayı artır (Ay 1 oynandı -> Ay 2)
+    # 12) ayı artır
     st.session_state.month = month + 1
-
     return ai
 
 # ------------------------------
-# INTRO MESAJI (Ay 1 başlamadan önce)
+# HEADER + AYARLAR
 # ------------------------------
-def generate_intro_message() -> None:
-    mode = st.session_state.selected_mode
-    idea_full = st.session_state.startup_idea
-    idea_short = " ".join((idea_full or "").strip().split()[:6]) or "Startup"
-    payload = offline_intro_payload(mode, idea_short)
-
-    # AI ile intro da üretilebilir; ama güvenli olsun diye offline veriyoruz.
-    # İstersen burayı AI'a da çevirebilirsin.
-    st.session_state.ui_history.append({
-        "role": "assistant",
-        "text": payload["text"],
-        "insights": payload["insights"],
-    })
-    st.session_state.last_choices = payload["choices"]
+def render_header(game_started: bool):
+    left, right = st.columns([0.82, 0.18], vertical_alignment="center")
+    with left:
+        st.markdown(
+            '<div class="hero-container">'
+            '<h1 class="hero-title">Startup Survivor RPG</h1>'
+            '<div class="hero-subtitle">Gemini Destekli Girişimcilik Simülasyonu (Web SaaS odaklı)</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    with right:
+        if hasattr(st, "popover"):
+            with st.popover("⚙️ Ayarlar", use_container_width=True):
+                render_settings_panel(game_started=game_started)
+        else:
+            with st.expander("⚙️ Ayarlar", expanded=False):
+                render_settings_panel(game_started=game_started)
 
 # ------------------------------
-# SESSION STATE INIT
+# SESSION INIT
 # ------------------------------
 def init_state():
     if "game_started" not in st.session_state:
@@ -822,7 +999,6 @@ def init_state():
     if "startup_idea" not in st.session_state:
         st.session_state.startup_idea = ""
 
-    # Setup (lobby)
     st.session_state.setdefault("setup_name", "İsimsiz Girişimci")
     st.session_state.setdefault("setup_gender", "Belirtmek İstemiyorum")
     st.session_state.setdefault("setup_start_money", 100_000)
@@ -839,32 +1015,10 @@ def init_state():
 init_state()
 apply_custom_css(st.session_state.selected_mode)
 
-# ------------------------------
-# UI: HEADER + SETTINGS BUTTON
-# ------------------------------
-def render_header(game_started: bool):
-    left, right = st.columns([0.82, 0.18], vertical_alignment="center")
-    with left:
-        st.markdown(
-            '<div class="hero-container">'
-            '<h1 class="hero-title">Startup Survivor RPG</h1>'
-            '<div class="hero-subtitle">Gemini Destekli Girişimcilik Simülasyonu (Web SaaS odaklı)</div>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    with right:
-        if hasattr(st, "popover"):
-            with st.popover("⚙️ Ayarlar", use_container_width=True):
-                render_settings_panel(game_started=game_started)
-        else:
-            with st.expander("⚙️ Ayarlar", expanded=False):
-                render_settings_panel(game_started=game_started)
-
-# ------------------------------
+# ============================================================
 # LOBBY
-# ------------------------------
+# ============================================================
 if not st.session_state.game_started:
-    # Sidebar: mod seçimi (oyuna başlamadan)
     with st.sidebar:
         st.header(f"👤 {st.session_state.setup_name}")
         mode_list = ["Gerçekçi", "Türkiye Simülasyonu", "Zor", "Extreme", "Spartan"]
@@ -879,12 +1033,10 @@ if not st.session_state.game_started:
         st.caption("Ayarlar: sağ üstte ⚙️")
 
     render_header(game_started=False)
-
     st.info("👇 Oyuna başlamak için iş fikrini yaz ve Enter'a bas.")
     startup_idea = st.chat_input("Girişim fikrin ne? (Örn: Üniversiteliler için proje yönetimi SaaS...)")
 
     if startup_idea:
-        # Player
         st.session_state.player = {
             "name": st.session_state.setup_name,
             "gender": st.session_state.setup_gender,
@@ -898,7 +1050,6 @@ if not st.session_state.game_started:
             "custom_traits": st.session_state.custom_traits_list,
         }
 
-        # Stats
         start_money = int(st.session_state.setup_start_money)
         start_loan = int(st.session_state.setup_start_loan)
 
@@ -921,9 +1072,8 @@ if not st.session_state.game_started:
         }
         clamp_core_stats(st.session_state.stats)
 
-        # State reset
         st.session_state.expenses = {"salary": 0, "server": 0, "marketing": 0, "total": 0}
-        st.session_state.month = 1  # ✅ Ay 1'den başla
+        st.session_state.month = 1
         st.session_state.game_started = True
         st.session_state.game_over = False
         st.session_state.game_over_reason = ""
@@ -933,20 +1083,44 @@ if not st.session_state.game_started:
         st.session_state.pending_move = None
         st.session_state.startup_idea = startup_idea
 
-        # Chat: kullanıcının fikrini 1 kere "user mesajı" olarak ekle
+        # chat: user fikri
         st.session_state.ui_history.append({"role": "user", "text": startup_idea})
 
-        # Model history: sadece bağlam
-        st.session_state.model_history.append({"role": "user", "parts": [f"Startup fikrim: {startup_idea}"]})
+        # AI: fikri analiz + hikaye + Ay1 kriz + seçenekler
+        mode = st.session_state.selected_mode
+        char_desc = build_character_desc(st.session_state.player)
 
-        # ✅ Ay 1 başlamadan intro mesajı üret (ay atlamadan)
-        generate_intro_message()
+        intro_prompt = build_intro_prompt(mode, startup_idea, char_desc, st.session_state.stats)
+        raw = call_gemini(intro_prompt, [])
+        data = None
+        if raw:
+            try:
+                data = json.loads(clean_json(raw))
+            except Exception:
+                data = None
+        if data is None:
+            data = offline_intro_payload(mode, startup_idea)
+
+        intro = validate_ai_payload(data)
+
+        st.session_state.ui_history.append(
+            {
+                "role": "assistant",
+                "crisis_line": intro.get("crisis_line", ""),
+                "idea_analysis": intro.get("idea_analysis", []),
+                "text": intro.get("text", ""),
+                "insights": intro.get("insights", []),
+            }
+        )
+        st.session_state.last_choices = intro.get("choices", []) or []
+        st.session_state.model_history.append({"role": "user", "parts": [f"Startup fikrim: {startup_idea}"]})
+        st.session_state.model_history.append({"role": "model", "parts": [intro.get("text", "")]})
 
         st.rerun()
 
-# ------------------------------
+# ============================================================
 # GAME OVER
-# ------------------------------
+# ============================================================
 elif st.session_state.game_over:
     render_header(game_started=True)
     st.error("💀 GAME OVER")
@@ -955,9 +1129,9 @@ elif st.session_state.game_over:
         st.session_state.clear()
         st.rerun()
 
-# ------------------------------
+# ============================================================
 # GAME
-# ------------------------------
+# ============================================================
 else:
     render_header(game_started=True)
 
@@ -965,7 +1139,6 @@ else:
     with st.sidebar:
         st.header(f"👤 {st.session_state.player.get('name','İsimsiz Girişimci')}")
 
-        # ✅ Mod seçimi: Ay göstergesinin üstünde
         mode_list = ["Gerçekçi", "Türkiye Simülasyonu", "Zor", "Extreme", "Spartan"]
         cur_mode = st.session_state.get("selected_mode", "Gerçekçi")
         st.session_state.selected_mode = st.selectbox(
@@ -975,11 +1148,9 @@ else:
             key="mode_select_game",
         )
 
-        # Ay göstergesi (oynanacak ay)
         st.progress(min(st.session_state.month / 12.0, 1.0), text=f"🗓️ Ay: {st.session_state.month}/12")
         st.divider()
 
-        # Fikir: chat’te de var ama burada da “kısa erişim”
         with st.expander("💡 Girişim fikrim", expanded=False):
             st.write(st.session_state.startup_idea)
 
@@ -1029,11 +1200,23 @@ else:
         if st.session_state.last_chance_card:
             st.info(f"🃏 Son Kart: {st.session_state.last_chance_card.get('title','')}")
 
-    # CHAT (mesajlaşma gibi: user + assistant hepsi kalır)
+    # CHAT (mesajlar kaybolmaz)
     for msg in st.session_state.ui_history:
         role = msg.get("role", "assistant")
         with st.chat_message("user" if role == "user" else "assistant"):
+            if role != "user":
+                crisis_line = (msg.get("crisis_line") or "").strip()
+                if crisis_line:
+                    st.markdown(f"<div class='crisis-badge'>⚠️ {crisis_line}</div>", unsafe_allow_html=True)
+
+                idea_analysis = msg.get("idea_analysis", []) or []
+                if idea_analysis:
+                    with st.expander("🔎 Fikir analizi (yorum)", expanded=False):
+                        for a in idea_analysis:
+                            st.write(f"- {a}")
+
             st.write(msg.get("text", ""))
+
             if role != "user":
                 ins = msg.get("insights", []) or []
                 if ins:
@@ -1048,7 +1231,7 @@ else:
             st.session_state.clear()
             st.rerun()
     else:
-        # Seçenek kartları (kriz çözüm odaklı ve daha uzun)
+        # Seçenek kartları
         choices = st.session_state.last_choices or []
         if choices:
             st.caption("👇 Bu ayın krizine karşı bir çözüm seç (A/B) veya alttan serbest yaz.")
@@ -1058,28 +1241,45 @@ else:
                 title = (ch.get("title") or "").strip()
                 desc = (ch.get("desc") or "").strip()
                 steps = ch.get("steps", []) or []
+                expected = ch.get("expected", []) or []
+                risks = ch.get("risks", []) or []
+
                 with cols[idx]:
                     st.markdown(f"### {cid}) {title}")
                     if desc:
                         st.write(desc)
+
+                    if expected:
+                        st.write("**Beklenen etki:**")
+                        for e in expected:
+                            st.write(f"- {e}")
+
+                    if risks:
+                        st.write("**Riskler:**")
+                        for r in risks:
+                            st.write(f"- {r}")
+
                     if steps:
                         st.write("**Mini plan:**")
-                        for s in steps[:3]:
+                        for s in steps[:5]:
                             st.write(f"- {s}")
+
                     if st.button(f"✅ {cid} seç", key=f"choice_{st.session_state.month}_{idx}", use_container_width=True):
-                        # buton mantığını koru: tıklayınca mesaj olarak hamle yazdır
-                        st.session_state.pending_move = f"{cid}) {title}\n{desc}\n" + "\n".join([f"- {s}" for s in steps[:3]])
+                        st.session_state.pending_move = (
+                            f"{cid}) {title}\n\n{desc}\n\n"
+                            + ("Beklenen:\n" + "\n".join([f"- {e}" for e in expected]) + "\n\n" if expected else "")
+                            + ("Riskler:\n" + "\n".join([f"- {r}" for r in risks]) + "\n\n" if risks else "")
+                            + ("Plan:\n" + "\n".join([f"- {s}" for s in steps[:5]]) if steps else "")
+                        )
                         st.rerun()
 
-        # Kullanıcı hamlesi (pending varsa onu kullan)
-        user_move = st.session_state.pending_move or st.chat_input("Hamleni yaz... (Kriz çözümüne odaklan: 'şunu düzelt', 'şunu dene' gibi)")
+        user_move = st.session_state.pending_move or st.chat_input("Hamleni yaz... (krizi çözmeye odaklan)")
         if user_move:
             st.session_state.pending_move = None
-
-            # chat'e user mesajı ekle
             st.session_state.ui_history.append({"role": "user", "text": user_move})
 
             with st.spinner("Tur işleniyor..."):
+                # Turn AI: Önce python ile kriz hesaplanacak, sonra AI o krize göre hikaye + çözüm üretecek
                 run_turn(user_move)
 
             st.rerun()
