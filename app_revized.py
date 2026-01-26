@@ -4,6 +4,7 @@ import json
 import random
 import time
 import re
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
@@ -431,72 +432,257 @@ def validate_ai_payload(resp: Any) -> Dict[str, Any]:
         "game_over_reason": game_over_reason,
     }
 
+
+def build_offline_ai_payload(
+    *,
+    mode: str,
+    month: int,
+    user_input: str,
+    intent: str,
+    stats: Dict[str, Any],
+    expenses_total: int,
+    one_time_cost: int,
+    kpi_summary: Dict[str, Any],
+    chance_card: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """AI yokken oyunun 'öğretici + oyun' akmasını sağlayan basit anlatıcı.
+    Amaç: Uygulama quota yüzünden tamamen durmasın.
+    """
+    # Dil tonu
+    if mode == "Extreme":
+        tone = "absürt-enerjik"
+    elif mode == "Türkiye Simülasyonu":
+        tone = "TR-gerçekçi"
+    else:
+        tone = "gerçekçi"
+
+    # Kısa olay özeti
+    cc = ""
+    if chance_card:
+        cc = f"\n\n🃏 Bu ay sürpriz: {chance_card.get('title','')}. {chance_card.get('desc','')}"
+    headline_map = {
+        "growth": "Büyüme için gaza bastın.",
+        "product": "Ürünü sağlamlaştırmaya odaklandın.",
+        "monetize": "Para kazanma modelini kurcaladın.",
+        "team_ops": "Ekip ve operasyonu toparlamaya çalıştın.",
+        "fundraise": "Yatırımcı tarafında nabız yokladın.",
+        "general": "Genel bir hamle yaptın.",
+    }
+    headline = headline_map.get(intent, headline_map["general"])
+
+    if tone == "absürt-enerjik":
+        opener = f"Ay {month}: Evren yine saçmaladı. {headline}"
+    elif tone == "TR-gerçekçi":
+        opener = f"Ay {month}: Türkiye koşullarında {headline.lower()}"
+    else:
+        opener = f"Ay {month}: {headline}"
+
+    # Sayısal kısa durum
+    text = (
+        f"{opener}\n\n"
+        f"Bu ay giderlerin {format_currency(expenses_total)}. "
+    )
+    if one_time_cost:
+        text += f"Hamlenin tek seferlik maliyeti {format_currency(one_time_cost)}. "
+    text += (
+        f"MRR gelirin {format_currency(kpi_summary.get('mrr',0))} oldu.\n"
+        f"Aktif kullanıcı: {stats.get('active_users')}, Ödeyen: {stats.get('paid_users')}, CAC: {stats.get('cac')} TL."
+        f"{cc}"
+    )
+
+    # Insights (öğretici)
+    insights = []
+    # Runway
+    burn = max(0, int(expenses_total + one_time_cost) - int(kpi_summary.get("mrr", 0)))
+    if burn <= 0:
+        insights.append("Bu ay net olarak pozitif gittin: gelir gideri karşıladı. Bu noktada ölçekleme riski yönetimi kritik.")
+    else:
+        insights.append(f"Bu ay yaklaşık net yakımın {format_currency(burn)}. Runway'i uzatmak için ya MRR'ı artır ya da pazarlama/maaş dengesini ayarla.")
+
+    # Churn / retention
+    churn_pct = round(float(stats.get("churn", 0.10)) * 100, 1)
+    if churn_pct >= 15:
+        insights.append(f"Churn yüksek ({churn_pct}%). B2C/B2B fark etmeksizin bu, ürün değerinin tam oturmadığını gösterir; onboarding ve temel faydayı sadeleştir.")
+    else:
+        insights.append(f"Churn ({churn_pct}%) makul. Şimdi büyürken destek/kaliteyi düşürmemek önemli.")
+
+    # CAC & growth
+    insights.append("CAC tek başına iyi/kötü değildir; 'ödeyen kullanıcı * fiyat' (LTV) ile kıyaslanınca anlamlı olur. Küçük testlerle kanalı doğrula.")
+
+    # Choices (oyun)
+    choices = [
+        {"id": "A", "title": "Agresif büyüme", "desc": "Pazarlamayı artır, hızlı kullanıcı kazan. Risk: burn artar, churn yükselirse boşa gider."},
+        {"id": "B", "title": "Sağlamlaştır", "desc": "Onboarding/ürün iyileştir, churn ve dönüşümü iyileştir. Risk: büyüme yavaşlar."},
+    ]
+
+    # Next önerileri (basit)
+    marketing_now = int(stats.get("marketing_cost", 5000))
+    if intent == "growth":
+        next_marketing = int(marketing_now * 1.2)
+    elif intent == "product":
+        next_marketing = int(marketing_now * 0.95)
+    else:
+        next_marketing = int(marketing_now)
+
+    # moral/ekip önerisi
+    mot = int(stats.get("motivation", 50))
+    team = int(stats.get("team", 50))
+    mot_delta = -2 if mot < 35 else 0
+    team_delta = -1 if team > 80 and burn > 0 else 0
+
+    return {
+        "text": text,
+        "insights": insights[:3],
+        "choices": choices,
+        "next": {"marketing_cost": next_marketing, "team_delta": team_delta, "motivation_delta": mot_delta},
+        "game_over": False,
+        "game_over_reason": "",
+    }
+
+
 # --- 8. AI MODEL BAĞLANTISI (RETRY MEKANİZMALI) ---
+
+# --- 8. AI MODEL BAĞLANTISI (KOTA-DOSTU + MODEL FALLBACK + RETRY) ---
+def _parse_retry_delay_seconds(msg: str) -> Optional[int]:
+    """Gemini hata mesajlarından retry sürelerini yakalamaya çalışır."""
+    if not msg:
+        return None
+    # "Please retry in 33.37s"
+    m = re.search(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)s", msg, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(math.ceil(float(m.group(1))))
+        except Exception:
+            return None
+    # "retry_delay{seconds: 33"
+    m = re.search(r"retry_delay\{\s*seconds\s*:\s*([0-9]+)", msg, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+def _is_quota_zero(msg: str) -> bool:
+    return bool(re.search(r"limit\s*:\s*0", msg or "", flags=re.IGNORECASE))
+
+def _looks_like_quota_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("429" in m) or ("quota" in m) or ("rate" in m and "limit" in m)
+
 def get_ai_response(prompt_history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    429 Quota hatası Streamlit Cloud'da sık görülür (özellikle herkese açık uygulamalarda),
+    çünkü aynı API key'i tüm kullanıcılar paylaşır.
+    Bu fonksiyon:
+    - Daha düşük maliyetli modelleri öne alır,
+    - 429 aldığında farklı modele/anahtara düşer,
+    - Gereksiz token tüketimini azaltmak için geçmişi kısaltır,
+    - JSON formatı bozulursa kısa bir 'self-heal' retry yapar.
+    """
+    st.session_state.ai_last_error = ""
+
     if "GOOGLE_API_KEYS" not in st.secrets:
+        st.session_state.ai_last_error = "Secrets içinde GOOGLE_API_KEYS yok."
         st.error("HATA: Secrets dosyasında GOOGLE_API_KEYS bulunamadı!")
         return None
 
     api_keys = st.secrets["GOOGLE_API_KEYS"]
-    key = random.choice(list(api_keys))
-    genai.configure(api_key=key)
+    if isinstance(api_keys, str):
+        api_keys = [api_keys]
+    api_keys = [k for k in api_keys if isinstance(k, str) and k.strip()]
+    if not api_keys:
+        st.session_state.ai_last_error = "GOOGLE_API_KEYS boş."
+        st.error("HATA: GOOGLE_API_KEYS boş görünüyor.")
+        return None
 
-    priority_models = [
-        "models/gemini-3-pro-preview",
-        "models/gemini-3-flash-preview",
-        "models/gemini-2.0-flash-exp",
+    # Model önceliği: önce daha ucuz/erişilebilir modeller.
+    # Not: Bazı hesaplarda 'gemini-3-pro' free-tier kotası 0 olabilir. (Ekran görüntündeki hata gibi.)
+    # Bu yüzden 3-pro'yu en sona attık.
+    secret_model = st.secrets.get("GEMINI_MODEL", "")
+    # Model önceliği: önce Gemini 2.5 Flash (senin istediğin), sonra fallback'ler.
+    # Not: google-generativeai SDK'da çoğu zaman kısa isimler çalışır (ör. "gemini-2.5-flash").
+    # Bazı ortamlarda "models/..." formu gerekebilir; o yüzden ikisini de aday listesine ekliyoruz.
+    model_candidates = [
+        secret_model.strip() if isinstance(secret_model, str) else "",
+        "gemini-2.5-flash",
+        "models/gemini-2.5-flash",
         "gemini-2.0-flash",
+        "gemini-1.5-flash",
         "gemini-1.5-pro",
+        "models/gemini-3-flash-preview",
+        "models/gemini-3-pro-preview",
     ]
+    model_candidates = [m for m in model_candidates if m]
 
-    selected_model = None
-    for m_name in priority_models:
-        try:
-            selected_model = genai.GenerativeModel(m_name)
-            break
-        except Exception:
-            continue
-
-    if not selected_model:
-        try:
-            selected_model = genai.GenerativeModel("gemini-1.5-flash")
-        except Exception:
-            st.error("Hiçbir AI modeline erişilemedi. API Key kotanızı kontrol edin.")
-            return None
+    # Token tüketimini azalt: sistem promptu (ilk mesaj) + son N mesaj
+    # (UI history değil, model_history zaten temiz, ama yine de büyümesini kontrol ediyoruz)
+    max_msgs = 14
+    if len(prompt_history) > max_msgs:
+        prompt_history = [prompt_history[0]] + prompt_history[-(max_msgs - 1):]
 
     config = {
         "temperature": 0.75,
-        "max_output_tokens": 4096,
+        "max_output_tokens": 2048,  # kota-dostu
         "response_mime_type": "application/json",
     }
 
-    max_retries = 3
-    current_history = prompt_history.copy()
+    # Deneme stratejisi:
+    # - Her model için 2 deneme
+    # - 429 ise başka model/key'e geç
+    # - JSONDecode ise kısa self-heal retry
+    for model_name in model_candidates:
+        for attempt in range(2):
+            key = random.choice(api_keys)
+            genai.configure(api_key=key)
 
-    for attempt in range(max_retries):
-        response = None
-        try:
-            response = selected_model.generate_content(current_history, generation_config=config)
-            text_response = clean_json(response.text)
-            json_data = json.loads(text_response)
-            return json_data
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt_history, generation_config=config)
+                text_response = clean_json(response.text)
+                return json.loads(text_response)
 
-        except json.JSONDecodeError:
-            failed_text = response.text if response and getattr(response, "text", None) else "Boş Cevap"
-            error_msg = (
-                "HATA: Geçerli JSON üretmedin. Lütfen SADECE istenen JSON formatında cevap ver; "
-                "markdown ```json kullanma, açıklama ekleme."
-            )
-            current_history.append({"role": "model", "parts": [failed_text]})
-            current_history.append({"role": "user", "parts": [error_msg]})
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(1)
-            continue
+            except json.JSONDecodeError:
+                # Model JSON dışına çıktıysa: 1 kez düzeltme mesajı ile retry.
+                failed_text = response.text if 'response' in locals() and response and getattr(response, "text", None) else ""
+                prompt_history = prompt_history + [
+                    {"role": "model", "parts": [failed_text or ""]},
+                    {"role": "user", "parts": [
+                        "SADECE JSON döndür. Markdown kullanma. Açıklama ekleme. İstenen şemayı eksiksiz doldur."
+                    ]},
+                ]
+                continue
 
-        except Exception as e:
-            st.error(f"Beklenmeyen AI Hatası: {str(e)}")
-            return None
+            except Exception as e:
+                msg = str(e)
+                st.session_state.ai_last_error = msg
+
+                # 429 / kota: başka model/key dene
+                if _looks_like_quota_error(msg):
+                    if _is_quota_zero(msg):
+                        # Bu, beklemekle düzelmez; modelin free-tier kotası 0.
+                        st.warning(
+                            f"AI kota hatası (429): Bu model için free-tier kota 0 görünüyor: **{model_name}**. "
+                            "Daha düşük bir model deniyorum…"
+                        )
+                    else:
+                        retry_s = _parse_retry_delay_seconds(msg) or 0
+                        # Streamlit uygulamasını kilitlememek için büyük gecikmeleri beklemiyoruz;
+                        # kullanıcı tekrar deneyince çalışır. Küçükse (<=5sn) bir kez bekleyelim.
+                        if 1 <= retry_s <= 5:
+                            time.sleep(retry_s)
+                    break  # bu model/attempt bitti -> sıradaki modele geç
+
+                # Diğer hatalar: sıradaki modele geç (örn. model adı, erişim, key vb.)
+                break
+
+    # Hepsi başarısızsa
+    st.error(
+        "AI şu an yanıt veremedi (kota/erişim). "
+        "Çözüm: AI Studio/Google Cloud tarafında **billing + quota** kontrol et veya `GEMINI_MODEL`'i daha erişilebilir bir modele çek."
+    )
+    return None
+
 
 # --- 9. STATE YÖNETİMİ ---
 if "game_started" not in st.session_state:
@@ -720,14 +906,21 @@ GÖREV:
     chat_history.append({"role": "user", "parts": [user_input]})
 
     ai_raw = get_ai_response(chat_history)
-    ai = validate_ai_payload(ai_raw) if ai_raw else {
-        "text": "AI yanıt veremedi. (Kota / format / bağlantı) Aynı hamleyi tekrar deneyebilirsin.",
-        "insights": [],
-        "choices": [],
-        "next": {},
-        "game_over": False,
-        "game_over_reason": "",
-    }
+    if ai_raw:
+        ai = validate_ai_payload(ai_raw)
+    else:
+        # AI kota/erişim sorunu yaşarsa oyun yine de akmaya devam etsin (offline anlatıcı).
+        ai = build_offline_ai_payload(
+            mode=mode,
+            month=current_month,
+            user_input=user_input,
+            intent=intent,
+            stats=stats,
+            expenses_total=total_expense,
+            one_time_cost=one_time_cost,
+            kpi_summary=kpi_summary,
+            chance_card=chance_card,
+        )
 
     # Python game-over öncelikli (hakem)
     if python_game_over:
