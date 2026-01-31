@@ -1,3 +1,4 @@
+import html
 import os
 import re
 import json
@@ -1001,7 +1002,13 @@ else:
             st.markdown(f"<div class='choice-title'>A) {a.get('baslik','A Planı')}</div>", unsafe_allow_html=True)
             steps = a.get("adimlar", [])
             if steps:
-                st.markdown("<ul class='choice-steps'>" + "".join([f"<li>{st.escape(s)}</li>" for s in steps]) + "</ul>", unsafe_allow_html=True)
+                st.markdown(
+    "<ul class='choice-steps'>"
+    + "".join([f"<li>{html.escape(str(s))}</li>" for s in (steps or [])])
+    + "</ul>",
+    unsafe_allow_html=True
+)
+
             st.markdown("</div>", unsafe_allow_html=True)
             if st.button("A seç", key=f"chooseA_{ss['month']}", use_container_width=True):
                 resolve_action("A")
