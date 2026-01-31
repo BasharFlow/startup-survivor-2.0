@@ -1,27 +1,24 @@
-# app.py
-# Startup Survivor RPG — Streamlit single-file app
-# Fixes:
-# - No duplicate "same crisis/analysis" logs (proper state locks)
-# - Real chat flow with persistent chat history
-# - Mode behaviors: Realist, Hard, Spartan, Extreme, Turkey (no "dayı factor")
-# - Character customization restored
-#
-# Secrets: Prefer
-#   GEMINI_API_KEY="AIza..."
-# (If you set it as a list GEMINI_API_KEY=[...], we will take the first item.)
+# app.py — Startup Survivor RPG (single-file)
+# Fixes requested:
+# - Real chat flow: everything renders via st.chat_message (including choices)
+# - Crisis is longer, clearer, actionable; options are mid-length and high-quality
+# - Cold open crisis teaser at the very start of each month (especially month 1)
+# - UI layout: Character customization on TOP-RIGHT, mode selection above "calendar"/season controls
+# - "Churn" renamed in UI to Turkish: "Kayıp Oranı"
+# - Prevents duplicate month content via robust state locks (no repeating crisis)
+# - More robust Gemini JSON parsing with repair attempt; strong local fallback if LLM fails
 
 from __future__ import annotations
 
 import os
 import json
 import random
-import textwrap
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import streamlit as st
 
-# Optional Gemini import (works if installed on Streamlit Cloud)
+# Optional Gemini import
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
@@ -30,48 +27,43 @@ except Exception:
 
 
 # -----------------------------
-# Styling
+# Page config
 # -----------------------------
 st.set_page_config(page_title="Startup Survivor RPG", layout="wide")
 
 APP_TITLE = "Startup Survivor RPG"
-APP_SUB = "Sohbet akışı korunur. Ay 1'den başlar. Durum Analizi → Kriz → A/B seçimi."
+APP_SUB = "Akış: (Teaser) → Durum Analizi → Kriz → A/B seçimi. Her ay 1 kez üretilir, tekrar etmez."
+
 
 # -----------------------------
-# Helpers
+# Utilities
 # -----------------------------
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def fmt_try(n: float) -> str:
-    # Turkish number formatting-ish
     n_int = int(round(n))
     s = f"{n_int:,}".replace(",", ".")
     return f"{s} ₺"
 
 def safe_get_secret_key() -> Optional[str]:
     key = None
-    # 1) streamlit secrets
     try:
         if "GEMINI_API_KEY" in st.secrets:
             key = st.secrets["GEMINI_API_KEY"]
     except Exception:
         key = None
-    # 2) env
+
     if not key:
         key = os.getenv("GEMINI_API_KEY")
 
-    # If user stored it as list in secrets TOML:
-    # GEMINI_API_KEY=["k1","k2"]
+    # If stored as TOML list: GEMINI_API_KEY=[...]
     if isinstance(key, (list, tuple)):
-        if len(key) > 0:
-            key = key[0]
-        else:
-            key = None
+        key = key[0] if len(key) else None
 
     if isinstance(key, str):
         key = key.strip().strip('"').strip("'")
-        if key == "":
+        if not key:
             return None
     return key
 
@@ -80,55 +72,64 @@ def model_ready() -> Tuple[bool, str]:
     if not key:
         return (False, "GEMINI_API_KEY bulunamadı. Secrets/env eklemeden model çağrıları çalışmaz.")
     if not GEMINI_AVAILABLE:
-        return (False, "google-generativeai paketi yok gibi görünüyor. (Streamlit Cloud'da genelde var.)")
+        return (False, "google-generativeai paketi yok gibi görünüyor.")
     return (True, "Gemini anahtarı görüldü. Model çağrıları çalışmalı.")
 
-def init_gemini() -> Optional[Any]:
+def init_gemini():
     ok, _ = model_ready()
     if not ok:
         return None
-    key = safe_get_secret_key()
     try:
-        genai.configure(api_key=key)
-        # You can change model if you want
+        genai.configure(api_key=safe_get_secret_key())
         return genai.GenerativeModel("gemini-1.5-flash")
     except Exception:
         return None
 
-def llm_generate(prompt: str, temperature: float = 0.9) -> str:
-    """
-    Uses Gemini if available; otherwise returns a deterministic-ish placeholder.
-    """
+def llm_call(prompt: str, temperature: float = 0.9, max_tokens: int = 800) -> str:
     model = st.session_state.get("gemini_model")
     if model is None:
-        # Offline fallback: still keep gameplay functional.
-        # (You can remove this if you want hard-fail without API.)
-        seed = st.session_state.get("rng_seed", 42)
-        r = random.Random(seed + st.session_state.get("month", 1) * 997)
-        lines = [
-            "Model yok: Yerel anlatıcı devrede.",
-            "Bu tur, sistem test modunda ilerliyor.",
-            f"Prompt özeti: {prompt[:120].replace(chr(10),' ')}...",
-            f"Şans faktörü: {r.randint(1, 100)}/100",
-        ]
-        return "\n".join(lines)
+        return ""  # will trigger local fallback
 
     try:
-        # generation_config varies by version; keep it simple:
         resp = model.generate_content(
             prompt,
-            generation_config={"temperature": temperature, "max_output_tokens": 600},
+            generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
         )
-        txt = getattr(resp, "text", None)
-        if not txt:
-            return "Model cevap vermedi (boş çıktı)."
+        txt = getattr(resp, "text", "") or ""
         return txt.strip()
-    except Exception as e:
-        return f"Model çağrısı hata verdi: {e}"
+    except Exception:
+        return ""
+
+
+def strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith("```"):
+        # remove first fence line and last fence
+        lines = s.splitlines()
+        if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].startswith("```"):
+            return "\n".join(lines[1:-1]).strip()
+    return s
+
+def extract_json(s: str) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+    s = strip_code_fences(s)
+    s = s.strip()
+
+    # Find outermost JSON object
+    if "{" in s and "}" in s:
+        start = s.find("{")
+        end = s.rfind("}")
+        candidate = s[start:end + 1].strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+    return None
 
 
 # -----------------------------
-# Game Data
+# Game models
 # -----------------------------
 MODES = ["Realist", "Hard", "Spartan", "Extreme", "Türkiye"]
 
@@ -143,10 +144,10 @@ class Character:
 class Metrics:
     cash: float = 1_000_000
     mrr: float = 0
-    churn: float = 0.05  # 0-1
-    reputation: float = 50  # 0-100
-    support_load: float = 20  # 0-100
-    infra_load: float = 20  # 0-100
+    churn: float = 0.05  # 0-1 (UI: Kayıp Oranı)
+    reputation: float = 50
+    support_load: float = 20
+    infra_load: float = 20
     monthly_salary: float = 50_000
     monthly_server: float = 6_100
     monthly_marketing: float = 5_300
@@ -158,82 +159,47 @@ class Metrics:
 @dataclass
 class TurnContent:
     month: int
+    teaser: str
     situation: str
     crisis: str
     option_a_title: str
     option_a_body: str
     option_b_title: str
     option_b_body: str
-    # for Extreme: keep which event used
     event_id: Optional[str] = None
 
 
 # -----------------------------
-# Extreme event pool (shareable, meme-able)
+# Event pools
 # -----------------------------
-# Tip: These should be "absurd but metric-linked". We'll also let LLM remix them.
 EXTREME_EVENTS = [
-    {
-        "id": "excel-cult",
-        "hook": "Kurumsal müşteri ürünü Excel’e çevirmeye çalışıyor: 'AI güzel ama bizde süreç Excel'.",
-        "impact": "scope patlar, support yükselir, itibar 'enterprise-ready' beklentisine kilitlenir.",
-    },
-    {
-        "id": "influencer-wrong-feature",
-        "hook": "Influencer ürünü övüyor ama yanlış özelliği övüyor: trafik geldi, kafa da geldi.",
-        "impact": "churn artar; doğru vaadi söylemezsen MRR büyümesi 'yanlış kullanıcı' ile zehirlenir.",
-    },
-    {
-        "id": "twitter-misread",
-        "hook": "X (Twitter) seni yanlış anlıyor: ürünün adı 'dolandırıcılık thread’i'ne düşüyor.",
-        "impact": "itibar düşer, support patlar, ama doğru karşı hamleyle viral toparlanma şansı doğar.",
-    },
-    {
-        "id": "appstore-review-poetry",
-        "hook": "App Store’da 1 yıldız: 'Uygulama beni duygulandırdı' — nedenini kimse bilmiyor.",
-        "impact": "itibar dalgalanır; belirsizlik churn’ü artırır ama anlatıyı çevirirsen MRR sıçrayabilir.",
-    },
-    {
-        "id": "payment-meme",
-        "hook": "Ödeme sayfası meme oldu: 'Kredi kartım bile vazgeçti' diye paylaşım dönüyor.",
-        "impact": "conversion düşer, support yükselir; düzeltirsen bir anda MRR toparlar.",
-    },
-    {
-        "id": "kedi-filter-ddos",
-        "hook": "Kedi filtresi trendi: kullanıcılar ekranı kediye çevirip senin OCR’ı kırıyor, aynı anda DDOS gibi.",
-        "impact": "infra load tavan, support 'kedi dili' ticket’ı, itibar komediye döner.",
-    },
-    {
-        "id": "corporate-legal-moment",
-        "hook": "Kurumsal hukuk, 'AI kelimesini 14 kez yazmışsınız' diye 17 sayfa düzeltme ister.",
-        "impact": "satış döngüsü uzar; cash burn sürer; ama doğru paketle MRR büyük gelebilir.",
-    },
-    {
-        "id": "viral-wrong-country",
-        "hook": "Viral oldun ama yanlış ülkede: trafik Peru’dan, ödeme Türkiye IBAN istiyor.",
-        "impact": "support yükü + ödeme hataları; churn yükselir; doğru lokalizasyonla MRR artabilir.",
-    },
-    {
-        "id": "founder-hot-take",
-        "hook": "Senin eski bir tweet’in gündem: 'Onboarding gereksiz' demişsin; onboarding’in şu an 6 adım.",
-        "impact": "itibar sarsılır; ürün ekibi birbirine girer; yalınlaştırırsan kazanırsın.",
-    },
-    {
-        "id": "b2b-procurement-portal",
-        "hook": "Procurement portalı: müşteri seni 9 farklı portala davet ediyor; her portal şifre istiyor.",
-        "impact": "time sink + churn riski; ama kapatırsan büyük MRR gelebilir.",
-    },
+    {"id": "excel-cult", "hook": "Kurumsal müşteri ürünü Excel’e çevirmeye çalışıyor: 'AI güzel ama bizde süreç Excel'.",
+     "impact": "Scope patlar, support yükselir, itibar 'enterprise-ready' beklentisine kilitlenir."},
+    {"id": "influencer-wrong-feature", "hook": "Influencer ürünü övüyor ama yanlış özelliği övüyor: trafik geldi, kafa da geldi.",
+     "impact": "Yanlış kullanıcı dolar; churn ve support artar. Doğru vaadi netleştirirsen MRR toparlar."},
+    {"id": "payment-meme", "hook": "Ödeme sayfası meme oldu: 'Kredi kartım bile vazgeçti' diye paylaşım dönüyor.",
+     "impact": "Conversion düşer; düzeltirsen ters viral + MRR sıçraması olur."},
+    {"id": "kedi-filter-ddos", "hook": "Kedi filtresi trendi: herkes ekranı kediye çevirip OCR’ı kırıyor; trafik DDOS gibi.",
+     "impact": "Infra tavan, support 'kedi dili' ticket’ı; stabiliteye oynamazsan kasa yanar."},
+    {"id": "twitter-misread", "hook": "X seni yanlış anladı: ürün 'komplo' thread’ine düştü, herkes 'kanıt' istiyor.",
+     "impact": "İtibar düşer, support patlar. Doğru karşı hamleyle itibar geri gelir, talep bile artabilir."},
+    {"id": "viral-wrong-country", "hook": "Viral oldun ama yanlış ülkede: trafik Peru’dan, ödeme ekranın Türkiye IBAN istiyor.",
+     "impact": "Support yükü + ödeme hatası. Lokalizasyonla MRR açılır; yoksa churn artar."},
+    {"id": "procurement-portal", "hook": "Procurement portalı cehennemi: 9 farklı portala davetlisin; her biri şifre ve form istiyor.",
+     "impact": "Zaman yer, cash yanar. Bitirirsen tek anlaşmayla MRR patlar."},
+    {"id": "hot-take-backfire", "hook": "Eski tweet’in gündem: 'Onboarding gereksiz' demişsin; onboarding’in 6 adım çıkıyor.",
+     "impact": "İtibar sarsılır. Yalınlaştırırsan kazanırsın; inat edersen churn büyür."},
 ]
 
-# For non-extreme modes, we still want variety, but less absurd.
-REALIST_CRISIS_THEMES = [
+REALIST_THEMES = [
     "onboarding sürtünmesi", "netlik/vaat belirsizliği", "pricing kararsızlığı",
-    "performans/altyapı darboğazı", "support yükü", "kanal verimsizliği", "churn artışı",
+    "performans/altyapı darboğazı", "support yükü", "kanal verimsizliği", "kullanıcı beklentisi kayması"
 ]
+
 TURKEY_THEMES = [
-    "kur sıçraması ve SaaS maliyeti", "tahsilat gecikmesi (30-60 gün)",
-    "KDV/stopaj sürprizi", "e-fatura/e-arşiv zorunluluğu", "platform komisyonu artışı",
-    "asgari ücret/yan hak baskısı", "pazarlama CPM zıplaması", "kurumsal 'fatura kesemezsen olmaz' şartı",
+    "kur/enflasyon sunucu maliyeti", "tahsilat gecikmesi (30-60 gün)", "KDV/stopaj sürprizi",
+    "e-fatura/e-arşiv zorunluluğu", "platform komisyonu artışı", "asgari ücret/yan hak baskısı",
+    "kurumsal 'fatura kesemezsen olmaz' şartı"
 ]
 
 
@@ -242,38 +208,25 @@ TURKEY_THEMES = [
 # -----------------------------
 def mode_instructions(mode: str) -> str:
     if mode == "Realist":
-        return (
-            "Gerçekçi, dengeli ve profesyonel bir simülasyon anlatıcısısın. "
-            "Mantıklı kararları ödüllendir, piyasa koşullarını gerçek dünyaya yakın kur. "
-            "Abartma; net trade-off ver."
-        )
+        return ("Gerçekçi, dengeli ve profesyonel bir simülasyon anlatıcısısın. "
+                "Mantıklı trade-off ver, abartma, net sebep-sonuç kur.")
     if mode == "Hard":
-        return (
-            "Zorlayıcı bir finansal denetçi gibisin. "
-            "Her seçenek bedel içersin; kolay çıkış yok. "
-            "Küçük hataları bile maliyetlendir; ama adil ol."
-        )
+        return ("Zorlayıcı bir finansal denetçi gibisin. "
+                "Her kararın bedeli var. Kolay çıkış yok ama adil ol.")
     if mode == "Spartan":
-        return (
-            "Acımasız ayı piyasası gibi davran. "
-            "Hukuki/teknik/finansal engelleri artır, şans faktörünü azalt. "
-            "Hayatta kalma testi; seçenekler sert ve riskli olsun."
-        )
+        return ("Acımasız ayı piyasası gibi davran. Engeller sert, maliyet yüksek. "
+                "Hayatta kalma testi. Şans düşük.")
     if mode == "Extreme":
-        return (
-            "Kaos teorisi anlatıcısısın. Mantık ikinci planda; paylaşmalık absürtlük üret. "
-            "Absürt olayların %80'i sosyal medya/platform/influencer/kurumsal saçmalık/kullanıcı davranışı kaynaklı olsun. "
-            "%15'i sürreal ama metaforik (abartılmış gerçek). %5'i nadir sci-fi cameo (çok nadir). "
-            "Kural: Ne kadar saçma olursa olsun sonuç startup metriklerine bağlanacak (kasa, churn, MRR, itibar, support, altyapı). "
-            "Kriz ve durum analizi özgün, komik, ekran görüntüsü aldıracak kadar iyi olsun."
-        )
+        return ("Kaos teorisi anlatıcısısın. Mantık ikinci planda; paylaşmalık absürtlük üret. "
+                "Absürt olayların %80'i sosyal medya/platform/influencer/kurumsal saçmalık/kullanıcı davranışı kaynaklı olsun. "
+                "%15 sürreal ama metaforik (abartılmış gerçek). %5 nadir sci-fi cameo. "
+                "Kural: Ne kadar saçma olursa olsun sonuç mutlaka startup metriklerine bağlanır (kasa, MRR, kayıp oranı, itibar, support, altyapı). "
+                "Tekrar eden cümlelerden kaçın. Sahne gibi yaz.")
     if mode == "Türkiye":
-        return (
-            "Türkiye pazarına benzeyen dengeli bir anlatıcı ol. "
-            "Kur/enflasyon, tahsilat gecikmesi, KDV/stopaj, e-fatura, platform komisyonu, kurumsal fatura şartı gibi gerçek dinamikleri kat. "
-            "Ama 'dayı faktörü' gibi karikatürleştirme yok; gerçekçi, günlük hayat gibi."
-        )
-    return "Dengeli bir simülasyon anlatıcısısın."
+        return ("Türkiye pazarına benzeyen gerçekçi bir anlatıcı ol. "
+                "Kur/enflasyon, tahsilat gecikmesi, KDV/stopaj, e-fatura, platform komisyonu, kurumsal fatura şartı gibi dinamikleri kat. "
+                "Karikatür yok; günlük hayat gibi.")
+    return "Dengeli bir anlatıcı ol."
 
 def build_turn_prompt(
     idea: str,
@@ -282,99 +235,171 @@ def build_turn_prompt(
     mode: str,
     month: int,
     season_len: int,
-    extra_hook: Optional[str] = None,
+    hook: str,
+    last_style_avoid: str,
 ) -> str:
-    # We want: Situation Analysis (story-like), Crisis (detailed), A/B short paragraph each (not too short/too long)
-    # Output must be JSON so we can parse safely.
-    hook_line = f"\nEK HOOK: {extra_hook}\n" if extra_hook else ""
+    # Strong length targets (quality guardrails)
+    # - teaser: 1 cümle, 12-22 kelime
+    # - situation: 90-140 kelime (tek paragraf, hikayesel)
+    # - crisis: 90-140 kelime (tek paragraf, net ve somut, metriklerle)
+    # - options: 80-120 kelime (tek paragraf, 2-3 adım + tradeoff)
 
     return f"""
-Sen bir metin tabanlı girişim RPG oyun motorusun.
+Sen metin tabanlı girişim RPG oyun motorusun.
 {mode_instructions(mode)}
 
-OYUNCU:
-- Karakter adı: {character.name}
+KARAKTER:
+- Ad: {character.name}
 - Arketip: {character.archetype}
 - Ton: {character.tone}
 - Risk: {character.risk_appetite}
 
-GİRİŞİM FİKRİ (oyuncunun yazdığı):
+FİKİR:
 {idea}
 
-MEVCUT METRİKLER:
-- Ay: {month}/{season_len}
-- Kasa: {metrics.cash:.0f}
-- MRR: {metrics.mrr:.0f}
-- Churn: {metrics.churn:.3f}
-- İtibar(0-100): {metrics.reputation:.1f}
-- Support yükü(0-100): {metrics.support_load:.1f}
-- Altyapı yükü(0-100): {metrics.infra_load:.1f}
-- Aylık gider: {metrics.burn:.0f}
+METRİKLER:
+Ay {month}/{season_len}
+Kasa {metrics.cash:.0f}, MRR {metrics.mrr:.0f}, KayıpOranı {metrics.churn:.3f}, İtibar {metrics.reputation:.0f}/100,
+Support {metrics.support_load:.0f}/100, Altyapı {metrics.infra_load:.0f}/100, AylıkGider {metrics.burn:.0f}
 
-{hook_line}
+HOOK (buna yaslan, ama birebir kopyalama):
+{hook}
 
-ÇIKTIYI SADECE JSON OLARAK VER (markdown yok, açıklama yok).
-JSON ŞEMASI:
+TEKRAR YASAĞI (buna benzeme):
+{last_style_avoid}
+
+SADECE JSON ÇIKTI VER (markdown yok, açıklama yok).
+ŞEMA:
 {{
-  "situation": "DURUM ANALİZİ: 1 paragraf ama dolu dolu; hikayesel, sahne gibi; fikri yorumlasın.",
-  "crisis": "KRİZ: 2-4 cümle; detaylı; bu ayın somut krizi + metriklere bağ (kasa yanması, churn, support, altyapı, itibar).",
-  "option_a_title": "A şıkkı kısa ama vurucu başlık",
-  "option_a_body": "A: Tek paragraf. Ne yapacaksın? Krizi nasıl çözebilir? Trade-off'u ne? Çok uzun olmasın.",
-  "option_b_title": "B şıkkı kısa ama vurucu başlık",
-  "option_b_body": "B: Tek paragraf. Ne yapacaksın? Krizi nasıl çözebilir? Trade-off'u ne? Çok uzun olmasın."
+ "teaser": "1 cümle, 12-22 kelime. Soğuk açılış gibi, paylaşmalık. (Ay/ürün adı geçebilir)",
+ "situation": "Tek paragraf, 90-140 kelime. Hikayesel sahne; oyuncunun fikrini yorumla; ekip/ kullanıcı davranışı detayı olsun.",
+ "crisis": "Tek paragraf, 90-140 kelime. Çok net kriz: ne oldu, neden oldu, bugün ne acıtıyor. En az 2 metrik sayıyla bağla.",
+ "option_a_title": "A başlığı: 3-6 kelime, vurucu",
+ "option_a_body": "Tek paragraf, 80-120 kelime. 2-3 adım çözüm + tradeoff. En az 1 metrik etkisini ima et.",
+ "option_b_title": "B başlığı: 3-6 kelime, vurucu",
+ "option_b_body": "Tek paragraf, 80-120 kelime. 2-3 adım çözüm + tradeoff. En az 1 metrik etkisini ima et."
 }}
 
 KURALLAR:
-- DURUM ANALİZİ ile KRİZ birbirinin kopyası olmasın. Durum analizi 'sahne' gibi, kriz 'somut problem' gibi.
-- Extreme modda komiklik ve absürtlük yüksek olmalı (ama metriklere bağlanmalı).
-- Realist/Hard/Spartan/Türkiye modlarında ton mode uygun olmalı.
+- Situation ve Crisis aynı cümleleri tekrar etmesin.
+- Extreme modda komiklik yüksek olsun (ama metrik bağlı).
+- Seçenekler "tek cümle" olamaz. Minimum kaliteyi koru.
 """.strip()
 
-def parse_json_safely(txt: str) -> Optional[Dict[str, Any]]:
-    # Try to extract JSON from model response (in case it added text)
-    txt = txt.strip()
-    # Find first "{" and last "}"
-    if "{" in txt and "}" in txt:
-        start = txt.find("{")
-        end = txt.rfind("}")
-        candidate = txt[start:end+1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            return None
-    return None
+
+def pick_hook(mode: str, month: int) -> Tuple[str, Optional[str]]:
+    r = random.Random(st.session_state.rng_seed + month * 1337)
+    if mode == "Extreme":
+        used = st.session_state.used_extreme_events
+        remaining = [e for e in EXTREME_EVENTS if e["id"] not in used]
+        if not remaining:
+            used.clear()
+            remaining = EXTREME_EVENTS[:]
+        ev = r.choice(remaining)
+        used.append(ev["id"])
+        return (f"{ev['hook']} Etki: {ev['impact']}", ev["id"])
+
+    if mode == "Türkiye":
+        theme = r.choice(TURKEY_THEMES)
+        return (f"TEMA: {theme}", None)
+
+    theme = r.choice(REALIST_THEMES)
+    return (f"TEMA: {theme}", None)
 
 
 # -----------------------------
-# Turn generation and state locks
+# Local fallback (still quality)
+# -----------------------------
+def local_fallback_turn(month: int, mode: str, idea: str, metrics: Metrics, hook: str, event_id: Optional[str]) -> TurnContent:
+    # A decent, non-generic fallback if LLM fails completely.
+    # Still follows length targets.
+    r = random.Random(st.session_state.rng_seed + month * 4242)
+
+    teaser = "Bu ay tek bir yanlış cümle, her şeyi komediye çevirip metriklerini tokatlayabilir."
+    if mode == "Extreme":
+        teaser = r.choice([
+            "Bir anda herkes senin ürünü yanlış şey için kullanıyor — ve internet bunu şova çeviriyor.",
+            "Bugün ürünün değil, algoritma seni yönetiyor: yanlış anlaşılma trend oluyor.",
+            "Bir kurumsal tablo, seni ‘startup’ değil ‘Excel eklentisi’ sanıp sahiplendi.",
+        ])
+
+    # Situation
+    situation = (
+        f"Ay {month}. {idea[:80].strip()}… diye başladın ama sahne kayıyor. "
+        "Bir yanda ekip ‘hız’ diye tempo tutuyor, diğer yanda kullanıcıların gözleri cam gibi: "
+        "ürün güzel ama ‘ne işe yarıyor’ cümlesi havada kalıyor. "
+        f"{hook.split('Etki:')[0].strip()} derken senin asıl derdin şu: "
+        "insanlar seni konuşuyor ama aynı şeyi anlamıyor. Her mesajın bir bedeli var; "
+        "doğru mesajı bulamazsan büyüme değil, gürültü satın alıyorsun."
+    )
+    # Crisis
+    crisis = (
+        f"Bu ay kriz net: kasa {fmt_try(metrics.cash)} iken aylık gider {fmt_try(metrics.burn)}; "
+        f"MRR {fmt_try(metrics.mrr)} ve kayıp oranı %{metrics.churn*100:.1f}. "
+        "Kullanıcıların yarısı ‘harika’ diyor, yarısı ‘bu kesin komplo’ diye ticket açıyor; "
+        "support yükün artmaya başladı ve bu artış altyapıyı da sürüklüyor. "
+        "Eğer bugün net bir vaade kilitlemezsen hem itibarın çalkalanacak hem de yanlış kitle yüzünden kayıp oranı yükselip MRR’ı zehirleyecek."
+    )
+    # Options
+    option_a_title = "Tek vaat, tek sahne"
+    option_a_body = (
+        "Ürünü tek bir ana vaade indir: ilk 60 saniyede tek ‘Aha!’ anı yarat. "
+        "Onboarding’i 3 adıma düşür, geri kalan özellikleri gizle ve sadece o ana vaadi ölç. "
+        "Support’u azaltmak için tek bir sabit cevap şablonu + mini rehber hazırla. "
+        "Trade-off: Kısa vadede bazı kullanıcılar ‘özellik yok’ diye ayrılır; ama doğru kitle kalır, kayıp oranı düşerken MRR daha temiz büyür."
+    )
+
+    option_b_title = "Kaosu yönetecek filtre"
+    option_b_body = (
+        "Gürültüyü ürünün içine filtrele: kullanıcıyı girişte iki yola ayır (anlık kullanım / öğrenme modu). "
+        "Yanlış beklentiyi azaltmak için ödeme ekranına net ‘bu ne değildir’ satırı ekle. "
+        "Altyapı/sunucu stresini azaltmak için ağır işleri sıraya al ve limit koy. "
+        "Trade-off: Büyüme daha yavaş görünür; ama itibar toparlanır, support/altyapı yükü düşer ve kasa daha uzun dayanır."
+    )
+
+    return TurnContent(
+        month=month,
+        teaser=teaser,
+        situation=situation,
+        crisis=crisis,
+        option_a_title=option_a_title,
+        option_a_body=option_a_body,
+        option_b_title=option_b_title,
+        option_b_body=option_b_body,
+        event_id=event_id,
+    )
+
+
+# -----------------------------
+# State management
 # -----------------------------
 def ensure_state():
-    if "initialized" not in st.session_state:
-        st.session_state.initialized = True
-        st.session_state.character = asdict(Character())
-        st.session_state.mode = "Extreme"
-        st.session_state.season_len = 12
-        st.session_state.metrics = asdict(Metrics())
-        st.session_state.idea = ""
-        st.session_state.game_started = False
-        st.session_state.month = 1
+    if "initialized" in st.session_state:
+        return
 
-        # Chat history
-        st.session_state.chat = []  # list of dicts: {role, content}
+    st.session_state.initialized = True
+    st.session_state.character = asdict(Character())
+    st.session_state.mode = "Extreme"
+    st.session_state.season_len = 12
+    st.session_state.metrics = asdict(Metrics())
+    st.session_state.idea = ""
+    st.session_state.game_started = False
+    st.session_state.month = 1
 
-        # Current pending turn content (generated but not yet resolved by A/B)
-        st.session_state.pending_turn = None  # dict TurnContent
+    # Chat log
+    st.session_state.chat: List[Dict[str, str]] = []
 
-        # Locks to prevent duplicates:
-        st.session_state.generated_months = set()  # months already generated+posted to chat
-        st.session_state.resolved_months = set()   # months already resolved (A/B applied)
+    # Turn state locks
+    st.session_state.pending_turn: Optional[Dict[str, Any]] = None
+    st.session_state.generated_months = set()  # months posted
+    st.session_state.resolved_months = set()   # months applied
 
-        # RNG + used events
-        st.session_state.rng_seed = random.randint(1, 10_000_000)
-        st.session_state.used_extreme_events = []
+    # For variety
+    st.session_state.rng_seed = random.randint(1, 10_000_000)
+    st.session_state.used_extreme_events = []
 
-        # Gemini model handle
-        st.session_state.gemini_model = init_gemini()
+    st.session_state.gemini_model = init_gemini()
+
 
 def chat_add(role: str, content: str):
     st.session_state.chat.append({"role": role, "content": content})
@@ -384,110 +409,114 @@ def render_chat():
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-def pick_extreme_event() -> Dict[str, str]:
-    used = st.session_state.used_extreme_events
-    # Choose without repeating until pool exhausted
-    remaining = [e for e in EXTREME_EVENTS if e["id"] not in used]
-    if not remaining:
-        used.clear()
-        remaining = EXTREME_EVENTS[:]
-    r = random.Random(st.session_state.rng_seed + st.session_state.month * 1337)
-    ev = r.choice(remaining)
-    used.append(ev["id"])
-    return ev
 
-def pick_theme(mode: str) -> str:
-    r = random.Random(st.session_state.rng_seed + st.session_state.month * 911)
-    if mode == "Türkiye":
-        return r.choice(TURKEY_THEMES)
-    return r.choice(REALIST_CRISIS_THEMES)
-
-def generate_turn_if_needed():
-    """
-    Generates a new turn for the current month exactly once, stores it in pending_turn,
-    and writes situation+crisis to chat exactly once.
-    """
+# -----------------------------
+# Turn generation (robust)
+# -----------------------------
+def generate_turn():
     if not st.session_state.game_started:
         return
 
     month = st.session_state.month
-    # If already resolved, do nothing
     if month in st.session_state.resolved_months:
         return
 
-    # If pending already for this month, do nothing
+    # If we already have pending for this month, do not regenerate
     pending = st.session_state.pending_turn
     if pending and pending.get("month") == month:
         return
 
-    # If we already generated+posted for this month, restore pending from cache if exists
-    # (Simpler: regenerate pending from stored object is not available; so we store pending in session state.)
-    # Our primary lock is "pending_turn", so if it's None we can generate.
     mode = st.session_state.mode
-    idea = st.session_state.idea
-    char = Character(**st.session_state.character)
+    idea = st.session_state.idea.strip()
+    character = Character(**st.session_state.character)
     metrics = Metrics(**st.session_state.metrics)
 
-    extra_hook = None
-    event_id = None
-    if mode == "Extreme":
-        ev = pick_extreme_event()
-        extra_hook = f"EXTREME OLAY: {ev['hook']} Etki: {ev['impact']}"
-        event_id = ev["id"]
-    else:
-        # Give model a theme hint for variety
-        extra_hook = f"TEMA: {pick_theme(mode)}"
+    hook, event_id = pick_hook(mode, month)
+
+    # Avoid repeating style: give last 2 assistant messages as "avoid"
+    last_avoid = ""
+    for m in reversed(st.session_state.chat[-6:]):
+        if m["role"] == "assistant":
+            last_avoid += m["content"][:200].replace("\n", " ") + "\n"
 
     prompt = build_turn_prompt(
         idea=idea,
-        character=char,
+        character=character,
         metrics=metrics,
         mode=mode,
         month=month,
         season_len=st.session_state.season_len,
-        extra_hook=extra_hook,
+        hook=hook,
+        last_style_avoid=last_avoid.strip() or "Yok",
     )
 
-    raw = llm_generate(prompt, temperature=0.95 if mode == "Extreme" else 0.8)
-    data = parse_json_safely(raw)
+    # 1) First attempt
+    raw = llm_call(prompt, temperature=0.95 if mode == "Extreme" else 0.85, max_tokens=900)
+    data = extract_json(raw)
 
-    if not data:
-        # Fallback minimal content
-        data = {
-            "situation": f"DURUM ANALİZİ: Ay {month}. Bir şeyler ters gidiyor ama henüz adını koymadın.",
-            "crisis": f"KRİZ: Bu ay belirsizlik büyüdü. Kasa yanıyor, churn tırmanabilir.",
-            "option_a_title": "A Planı",
-            "option_a_body": "A: Net bir hamle yap. Tek bir hedef seç ve oraya yüklen.",
-            "option_b_title": "B Planı",
-            "option_b_body": "B: Hasarı azalt. Önce stabiliteyi artır, sonra büyümeyi dene.",
-        }
+    # 2) Repair attempt if parse failed
+    if data is None and raw:
+        repair_prompt = f"""
+Aşağıdaki metni ŞEMAYA UYGUN TEK BİR JSON objesine dönüştür.
+SADECE JSON ver, başka hiçbir şey yazma.
 
-    turn = TurnContent(
-        month=month,
-        situation=str(data.get("situation", "")).strip(),
-        crisis=str(data.get("crisis", "")).strip(),
-        option_a_title=str(data.get("option_a_title", "A Planı")).strip(),
-        option_a_body=str(data.get("option_a_body", "")).strip(),
-        option_b_title=str(data.get("option_b_title", "B Planı")).strip(),
-        option_b_body=str(data.get("option_b_body", "")).strip(),
-        event_id=event_id,
-    )
+ŞEMA:
+{{
+ "teaser": "...",
+ "situation": "...",
+ "crisis": "...",
+ "option_a_title": "...",
+ "option_a_body": "...",
+ "option_b_title": "...",
+ "option_b_body": "..."
+}}
+
+METİN:
+{raw}
+""".strip()
+        raw2 = llm_call(repair_prompt, temperature=0.2, max_tokens=700)
+        data = extract_json(raw2)
+
+    # 3) Local fallback if still none
+    if data is None:
+        turn = local_fallback_turn(month, mode, idea, metrics, hook, event_id)
+    else:
+        # Validate and fill
+        def g(k: str, default: str) -> str:
+            v = str(data.get(k, "")).strip()
+            return v if v else default
+
+        turn = TurnContent(
+            month=month,
+            teaser=g("teaser", "Bu ay tek bir yanlış hamle, metriklerini yumruklar."),
+            situation=g("situation", "Bu ay sahne kayıyor: kullanıcılar farklı şeyler anlıyor."),
+            crisis=g("crisis", "Kriz net: belirsizlik büyüyor; kasa yanıyor ve kayıp oranı artma riski taşıyor."),
+            option_a_title=g("option_a_title", "A Planı"),
+            option_a_body=g("option_a_body", "Net bir hamle yap. Vaadi daralt, onboarding’i kısalt, ölç."),
+            option_b_title=g("option_b_title", "B Planı"),
+            option_b_body=g("option_b_body", "Hasarı azalt. Support/altyapı yükünü indir, sonra büyümeyi dene."),
+            event_id=event_id,
+        )
+
     st.session_state.pending_turn = asdict(turn)
 
-    # Post to chat once per month (prevents duplicates)
+    # Post to chat once per month
     if month not in st.session_state.generated_months:
-        chat_add("assistant", f"🧠 **DURUM ANALİZİ (Ay {month})**\n\n{turn.situation}")
-        chat_add("assistant", f"⚠️ **KRİZ**\n\n{turn.crisis}")
+        # Cold open teaser first (user asked "başlangıçta da kriz ver")
+        chat_add("assistant", f"🎬 **Soğuk Açılış (Ay {month})**\n\n{turn.teaser}")
+        chat_add("assistant", f"🧠 **Durum Analizi**\n\n{turn.situation}")
+        chat_add("assistant", f"⚠️ **Kriz**\n\n{turn.crisis}")
         st.session_state.generated_months.add(month)
 
+
+# -----------------------------
+# Apply choices
+# -----------------------------
 def apply_choice(choice: str):
-    """
-    Apply A/B choice to metrics with mode flavor.
-    Keep it deterministic-ish but varied.
-    """
     pending = st.session_state.pending_turn
     if not pending:
         return
+
     month = pending["month"]
     if month in st.session_state.resolved_months:
         return
@@ -495,124 +524,118 @@ def apply_choice(choice: str):
     mode = st.session_state.mode
     metrics = Metrics(**st.session_state.metrics)
 
-    # Base deltas
-    r = random.Random(st.session_state.rng_seed + month * (777 if choice == "A" else 778))
-    # make effect scales by mode
+    r = random.Random(st.session_state.rng_seed + month * (9991 if choice == "A" else 9992))
+
+    # Mode scales
     if mode == "Realist":
-        scale = 1.0
-        volatility = 0.6
+        scale, vol = 1.0, 0.7
     elif mode == "Hard":
-        scale = 1.1
-        volatility = 0.9
+        scale, vol = 1.1, 0.95
     elif mode == "Spartan":
-        scale = 1.2
-        volatility = 1.1
+        scale, vol = 1.25, 1.1
     elif mode == "Türkiye":
-        scale = 1.05
-        volatility = 0.95
+        scale, vol = 1.05, 0.95
     else:  # Extreme
-        scale = 1.0
-        volatility = 1.35
+        scale, vol = 1.0, 1.35
 
-    # Choice style: A tends to be bold, B tends to be defensive (but in Extreme, both can be chaotic)
-    bold = 1.0 if choice == "A" else 0.7
-    defend = 0.7 if choice == "A" else 1.0
+    bold = 1.0 if choice == "A" else 0.75
+    defend = 1.0 if choice == "B" else 0.8
 
-    # Compute deltas
-    # MRR can go up or down; churn inversely; support/infra can spike in Extreme
-    mrr_delta = (r.uniform(-0.02, 0.12) * metrics.mrr + r.uniform(80, 1200) * bold) * scale
-    churn_delta = (r.uniform(-0.02, 0.03) * volatility) * (1.0 if defend > 0.9 else 1.2)
-    rep_delta = r.uniform(-6, 9) * (defend * 0.9 + 0.2) * scale
-    support_delta = r.uniform(-8, 18) * volatility * (1.0 if choice == "A" else 0.7)
-    infra_delta = r.uniform(-6, 16) * volatility * (1.0 if choice == "A" else 0.75)
+    # Deltas
+    mrr_delta = (r.uniform(-0.02, 0.14) * (metrics.mrr + 1) + r.uniform(200, 2500) * bold) * scale
+    churn_delta = (r.uniform(-0.02, 0.04) * vol) * (0.9 if defend > 0.95 else 1.05)
+    rep_delta = r.uniform(-6, 10) * scale
+    support_delta = r.uniform(-10, 18) * vol
+    infra_delta = r.uniform(-8, 16) * vol
 
-    # Mode-specific twists
+    # Turkey dynamics
     if mode == "Türkiye":
-        # FX/inflation bite (server + salaries creep)
-        fx_hit = r.uniform(0.03, 0.11)
-        metrics.monthly_server *= (1.0 + fx_hit)
+        fx = r.uniform(0.03, 0.12)
+        metrics.monthly_server *= (1.0 + fx)
         metrics.monthly_salary *= (1.0 + r.uniform(0.02, 0.08))
-        # Collections delay: cash maybe doesn't reflect MRR immediately
         if r.random() < 0.35:
-            mrr_delta *= 0.6  # slower realized growth
-            rep_delta -= 2
+            # Collections delay: cash impact delayed
+            mrr_delta *= 0.75
+            rep_delta -= 1.5
 
+    # Spartan brutality
     if mode == "Spartan":
-        # Brutal: cash drains more, churn fights you
         churn_delta += r.uniform(0.01, 0.03)
-        rep_delta -= r.uniform(1, 4)
+        rep_delta -= r.uniform(1, 5)
         mrr_delta *= 0.9
 
+    # Extreme chaos
     if mode == "Extreme":
-        # Big swings tied to support/infra chaos
-        chaos = r.uniform(0.8, 1.6)
+        chaos = r.uniform(0.8, 1.7)
         support_delta *= chaos
         infra_delta *= chaos
-        # Viral luck sometimes
-        if r.random() < 0.25:
-            mrr_delta += r.uniform(500, 5000)
-            rep_delta += r.uniform(4, 14)
-        # But backlash sometimes
-        if r.random() < 0.22:
-            churn_delta += r.uniform(0.01, 0.06)
-            rep_delta -= r.uniform(4, 12)
+        if r.random() < 0.28:  # viral pop
+            mrr_delta += r.uniform(800, 7000)
+            rep_delta += r.uniform(6, 18)
+        if r.random() < 0.22:  # backlash
+            churn_delta += r.uniform(0.01, 0.07)
+            rep_delta -= r.uniform(6, 16)
 
-    # Apply updates
     metrics.mrr = max(0, metrics.mrr + mrr_delta)
     metrics.churn = clamp(metrics.churn + churn_delta, 0.0, 0.35)
     metrics.reputation = clamp(metrics.reputation + rep_delta, 0.0, 100.0)
     metrics.support_load = clamp(metrics.support_load + support_delta, 0.0, 100.0)
     metrics.infra_load = clamp(metrics.infra_load + infra_delta, 0.0, 100.0)
 
-    # Cash update: +MRR (approx) - burn - extra chaos costs
-    # simple monthly: cash += mrr - burn - overload penalties
-    overload_penalty = 0.0
+    # Cash update with overload penalties
+    overload = 0.0
     if metrics.support_load > 80:
-        overload_penalty += (metrics.support_load - 80) * 400
+        overload += (metrics.support_load - 80) * 450
     if metrics.infra_load > 80:
-        overload_penalty += (metrics.infra_load - 80) * 600
-
-    # In Extreme, overload is more punishing (tickets + downtime)
+        overload += (metrics.infra_load - 80) * 650
     if mode == "Extreme":
-        overload_penalty *= 1.3
+        overload *= 1.35
 
-    metrics.cash = metrics.cash + metrics.mrr - metrics.burn - overload_penalty
+    metrics.cash = metrics.cash + metrics.mrr - metrics.burn - overload
 
-    # Save
     st.session_state.metrics = asdict(metrics)
     st.session_state.resolved_months.add(month)
 
-    # Post resolution to chat ONCE
-    choice_title = pending["option_a_title"] if choice == "A" else pending["option_b_title"]
-    chat_add("user", f"Seçim: **{choice}** — {choice_title}")
+    # Log as chat
+    title = pending["option_a_title"] if choice == "A" else pending["option_b_title"]
+    chat_add("user", f"Seçimim: **{choice}** — {title}")
+
     chat_add(
         "assistant",
         "✅ Seçimin işlendi.\n\n"
-        f"- Kasa: {fmt_try(metrics.cash)}\n"
-        f"- MRR: {fmt_try(metrics.mrr)}\n"
-        f"- Churn: %{metrics.churn*100:.1f}\n"
-        f"- İtibar: {metrics.reputation:.0f}/100\n"
-        f"- Support: {metrics.support_load:.0f}/100\n"
-        f"- Altyapı: {metrics.infra_load:.0f}/100"
+        f"• Kasa: {fmt_try(metrics.cash)}\n"
+        f"• MRR: {fmt_try(metrics.mrr)}\n"
+        f"• Kayıp Oranı: %{metrics.churn*100:.1f}\n"
+        f"• İtibar: {metrics.reputation:.0f}/100\n"
+        f"• Support: {metrics.support_load:.0f}/100\n"
+        f"• Altyapı: {metrics.infra_load:.0f}/100"
     )
 
-    # Advance month (if season not ended)
+    # Advance month
     if st.session_state.month < st.session_state.season_len:
         st.session_state.month += 1
         st.session_state.pending_turn = None
     else:
-        chat_add("assistant", "🏁 Sezon bitti. İstersen ayarları değiştirip yeni sezon başlatabilirsin.")
+        chat_add("assistant", "🏁 Sezon bitti. Yeni sezon için Reset’e basabilirsin.")
         st.session_state.pending_turn = None
 
 
 # -----------------------------
-# Sidebar UI
+# UI
 # -----------------------------
 def sidebar_ui():
-    st.sidebar.markdown(f"## {st.session_state.character['name']}")
-    st.sidebar.caption(f"Mod: **{st.session_state.mode}**")
+    c = st.session_state.character
+    st.sidebar.markdown(f"## {c['name']}")
+    # Mode selection ABOVE season length (as you requested)
+    st.session_state.mode = st.sidebar.selectbox("Mod", MODES, index=MODES.index(st.session_state.mode))
+
+    st.session_state.season_len = st.sidebar.slider("Sezon uzunluğu (ay)", 3, 36, int(st.session_state.season_len))
     st.sidebar.caption(f"Ay: **{st.session_state.month}/{st.session_state.season_len}**")
     st.sidebar.progress(st.session_state.month / max(1, st.session_state.season_len))
+
+    # Starting cash (can be changed before start; after start, still adjustable if you want)
+    start_cash = st.sidebar.slider("Başlangıç kasası", 50_000, 5_000_000, int(st.session_state.metrics["cash"]), step=50_000)
+    st.session_state.metrics["cash"] = float(start_cash)
 
     m = Metrics(**st.session_state.metrics)
     st.sidebar.markdown("### Finansal Durum")
@@ -629,123 +652,114 @@ def sidebar_ui():
     st.sidebar.write(f"İtibar: **{m.reputation:.0f}/100**")
     st.sidebar.write(f"Support: **{m.support_load:.0f}/100**")
     st.sidebar.write(f"Altyapı: **{m.infra_load:.0f}/100**")
-    st.sidebar.write(f"Churn: **%{m.churn*100:.1f}**")
+    st.sidebar.write(f"Kayıp Oranı: **%{m.churn*100:.1f}**")
 
     st.sidebar.markdown("---")
-    if st.sidebar.button("🔄 Yeni Sezon / Reset"):
-        # full reset
+    if st.sidebar.button("🔄 Reset (Yeni Sezon)"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
 
-# -----------------------------
-# Main UI
-# -----------------------------
-def setup_panel():
-    st.markdown(f"# {APP_TITLE}")
-    st.caption(APP_SUB)
+def top_right_character_panel():
+    # Put character customization on TOP RIGHT as requested
+    colL, colR = st.columns([6, 2])
+    with colL:
+        st.markdown(f"# {APP_TITLE}")
+        st.caption(APP_SUB)
+    with colR:
+        with st.expander("🧩 Karakter", expanded=False):
+            c = st.session_state.character
+            c["name"] = st.text_input("Ad", value=c.get("name", "İsimsiz Girişimci"))
+            c["archetype"] = st.selectbox("Arketip", ["Genel", "Growth", "Product", "Sales", "Engineer", "Ops"],
+                                          index=["Genel","Growth","Product","Sales","Engineer","Ops"].index(c.get("archetype","Genel")))
+            c["tone"] = st.selectbox("Ton", ["Sert", "Komik", "Dramatik", "Kuru"],
+                                     index=["Sert","Komik","Dramatik","Kuru"].index(c.get("tone","Sert")))
+            c["risk_appetite"] = st.selectbox("Risk", ["Düşük", "Dengeli", "Yüksek"],
+                                              index=["Düşük","Dengeli","Yüksek"].index(c.get("risk_appetite","Dengeli")))
+            st.session_state.character = c
 
-    # Key status
+
+def setup_screen():
+    top_right_character_panel()
+
     ok, msg = model_ready()
     if ok:
         st.success(msg)
     else:
         st.error(msg)
-
-    with st.expander("🛠️ Karakterini ve ayarlarını Özelleştir (Tıkla)", expanded=False):
-        c = st.session_state.character
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            c["name"] = st.text_input("Karakter adı", value=c.get("name", "İsimsiz Girişimci"))
-            c["archetype"] = st.selectbox("Arketip", ["Genel", "Growth", "Product", "Sales", "Engineer", "Ops"], index=["Genel","Growth","Product","Sales","Engineer","Ops"].index(c.get("archetype","Genel")))
-        with col2:
-            st.session_state.mode = st.selectbox("Mod", MODES, index=MODES.index(st.session_state.mode))
-            c["tone"] = st.selectbox("Anlatım tonu", ["Sert", "Komik", "Dramatik", "Kuru"], index=["Sert","Komik","Dramatik","Kuru"].index(c.get("tone","Sert")))
-        with col3:
-            st.session_state.season_len = st.slider("Sezon uzunluğu (ay)", 6, 24, int(st.session_state.season_len))
-            # starting cash can be set before game starts
-            start_cash = st.slider("Başlangıç kasası", 50_000, 3_000_000, int(st.session_state.metrics["cash"]), step=50_000)
-            st.session_state.metrics["cash"] = float(start_cash)
-            c["risk_appetite"] = st.selectbox("Risk iştahı", ["Düşük", "Dengeli", "Yüksek"], index=["Düşük","Dengeli","Yüksek"].index(c.get("risk_appetite","Dengeli")))
-        st.session_state.character = c
+        st.caption("Not: Model yoksa da oyun çalışır; ama kalite için Gemini önerilir.")
 
     st.markdown("---")
+    st.info("Oyuna başlamak için girişim fikrini yaz.")
 
-    if not st.session_state.game_started:
-        st.info("Oyuna başlamak için girişim fikrini yaz.")
-        idea = st.text_area("Girişim fikrin ne?", height=140, value=st.session_state.idea)
-        st.session_state.idea = idea
+    st.session_state.idea = st.text_area("Girişim fikrin ne?", height=150, value=st.session_state.idea)
 
-        colA, colB = st.columns([1, 4])
-        with colA:
-            if st.button("🚀 Oyunu Başlat", type="primary"):
-                if not st.session_state.idea.strip():
-                    st.warning("Önce girişim fikrini yaz.")
-                else:
-                    # init gemini model now (in case secrets were added)
-                    st.session_state.gemini_model = init_gemini()
-                    st.session_state.game_started = True
-                    st.session_state.month = 1
-                    st.session_state.pending_turn = None
-                    st.session_state.generated_months = set()
-                    st.session_state.resolved_months = set()
-                    st.session_state.chat = []
-                    st.session_state.used_extreme_events = []
-                    chat_add("assistant", f"Tamam **{st.session_state.character['name']}**. Ay 1'den başlıyoruz. Mod: **{st.session_state.mode}**.")
-                    chat_add("assistant", "Önce **Durum Analizi**, sonra **Kriz**, sonra **A/B** seçeceksin.")
-                    st.rerun()
-        with colB:
-            st.caption("Not: Streamlit her etkileşimde rerun yapar. Bu uygulama tekrar yazma bug’ını state kilidiyle engeller.")
+    if st.button("🚀 Oyunu Başlat", type="primary"):
+        if not st.session_state.idea.strip():
+            st.warning("Önce girişim fikrini yaz.")
+            return
 
-def gameplay_panel():
+        st.session_state.gemini_model = init_gemini()
+        st.session_state.game_started = True
+        st.session_state.month = 1
+        st.session_state.pending_turn = None
+        st.session_state.generated_months = set()
+        st.session_state.resolved_months = set()
+        st.session_state.chat = []
+        st.session_state.used_extreme_events = []
+
+        chat_add("assistant", f"Tamam **{st.session_state.character['name']}**. Mod: **{st.session_state.mode}**. Ay 1’e giriyoruz.")
+        chat_add("assistant", "Kural: Önce soğuk açılış, sonra durum analizi, sonra net kriz, sonra A/B.")
+        st.rerun()
+
+
+def gameplay_screen():
+    top_right_character_panel()
+
+    # Generate current month content (once)
+    generate_turn()
+
     # Render chat
     render_chat()
 
-    # Generate turn if needed (no duplicates)
-    generate_turn_if_needed()
-
-    # Show pending turn actions
+    # Show choices INSIDE chat flow (not as a separate page section)
     pending = st.session_state.pending_turn
     if pending:
-        st.markdown("---")
-        st.subheader("Şimdi krize karşı bir çözüm seç (A/B).")
+        with st.chat_message("assistant"):
+            st.write("🧭 **Şimdi seçim zamanı.** A mı B mi?")
+            col1, col2 = st.columns(2)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"### A) {pending['option_a_title']}")
-            st.write(pending["option_a_body"])
-            if st.button("A seç", key=f"chooseA_{pending['month']}"):
-                apply_choice("A")
-                st.rerun()
+            with col1:
+                st.markdown(f"### A) {pending['option_a_title']}")
+                st.write(pending["option_a_body"])
+                if st.button("A seç", key=f"chooseA_{pending['month']}"):
+                    apply_choice("A")
+                    st.rerun()
 
-        with col2:
-            st.markdown(f"### B) {pending['option_b_title']}")
-            st.write(pending["option_b_body"])
-            if st.button("B seç", key=f"chooseB_{pending['month']}"):
-                apply_choice("B")
-                st.rerun()
+            with col2:
+                st.markdown(f"### B) {pending['option_b_title']}")
+                st.write(pending["option_b_body"])
+                if st.button("B seç", key=f"chooseB_{pending['month']}"):
+                    apply_choice("B")
+                    st.rerun()
 
-    # Chat input (optional note)
-    note = st.chat_input("İstersen bir not yaz (opsiyonel). Seçim yine A/B ile ilerler.")
+    # Optional free chat notes (kept in chat style)
+    note = st.chat_input("Not yazabilirsin (opsiyonel). Oyun ilerlemesi A/B ile olur.")
     if note:
         chat_add("user", note)
         st.rerun()
 
 
-# -----------------------------
-# App
-# -----------------------------
 def main():
     ensure_state()
     sidebar_ui()
 
     if not st.session_state.game_started:
-        setup_panel()
+        setup_screen()
     else:
-        st.markdown(f"# {APP_TITLE}")
-        st.caption(APP_SUB)
-        gameplay_panel()
+        gameplay_screen()
+
 
 if __name__ == "__main__":
     main()
