@@ -1,954 +1,1010 @@
-import os
+# app.py
+# Startup Survivor RPG — tek dosya Streamlit uygulaması
+# (kopyala/yapıştır çalıştır)
+
+from __future__ import annotations
+
 import json
+import os
 import random
-import html
 import re
+import textwrap
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
-
-# --- Optional Gemini dependency ---
+# Optional dependency: google-generativeai
 try:
-    import google.generativeai as genai
+    import google.generativeai as genai  # type: ignore
+    from google.api_core import exceptions as gexc  # type: ignore
 except Exception:  # pragma: no cover
-    genai = None
+    genai = None  # type: ignore
+    gexc = None  # type: ignore
 
 
-# =============================
-# UI / App config
-# =============================
-st.set_page_config(
-    page_title="Startup Survivor RPG",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# =========================
+# Config / Constants
+# =========================
 
+APP_TITLE = "Startup Survivor RPG"
+APP_SUBTITLE = "Sohbet akışı korunur. Ay 1'den başlar. Durum Analizi → Kriz → A/B seçimi."
 
-# =============================
-# Constants & Domain
-# =============================
+DEFAULT_MODEL_CANDIDATES = [
+    # Yeni/klasik isimler — NotFound olursa sırayla deneriz
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-pro",
+    "models/gemini-1.5-flash",
+    "models/gemini-1.5-pro",
+    "models/gemini-pro",
+]
 
 MODES = {
     "Normal": {
         "desc": "Dengeli. İyi kararlar ödüllenir, kötü kararlar acıtır.",
-        "temp": 0.7,
-        "difficulty": 1.0,
-        "tone_directives": "Ton: net, gerçekçi, yüksek tempo. Abartı yok.",
+        "temperature": 0.7,
+        "spice": "net, gerçekçi, ölçülü dramatik",
+        "extreme": False,
     },
     "Hard": {
-        "desc": "Daha sert. Yanlış kararlar çarpanlı gelir.",
-        "temp": 0.75,
-        "difficulty": 1.15,
-        "tone_directives": "Ton: gerçekçi ama daha stresli. Risk ve belirsizlik daha yüksek.",
+        "desc": "Hata affetmez. Küçük yanlışlar büyük fatura çıkarır.",
+        "temperature": 0.85,
+        "spice": "daha sert, daha riskli, daha az tolerans",
+        "extreme": False,
     },
     "Spartan": {
-        "desc": "Kaynak kısıtlı. Her seçim trade-off.",
-        "temp": 0.75,
-        "difficulty": 1.25,
-        "tone_directives": "Ton: disiplinli, keskin, 'az kaynakla savaş' hissi.",
+        "desc": "Kaynak kıt. Her karar bir şeyden vazgeçirir.",
+        "temperature": 0.75,
+        "spice": "minimal, tavizsiz, kaynak kısıtlı",
+        "extreme": False,
     },
     "Extreme": {
-        "desc": "Kaos ve absürt. Paylaşmalık olaylar. Sonuç metriklere çarpar.",
-        "temp": 0.9,
-        "difficulty": 1.35,
-        "tone_directives": (
-            "Ton: kaotik + kara mizah + viral anlar. "
-            "Her ay bir 'internet olayı' veya beklenmedik ters köşe üret.\n"
-            "Aylık olay tipleri dağılımı: "
-            "%50 platform/influencer/PR krizi, %30 sürreal metafor, %20 easter-egg (kült referans)."
-        ),
+        "desc": "Kaos ve absürt. Paylaşmalık olaylar. Mantık ikinci planda; sonuç metriklere çarpar.",
+        "temperature": 1.0,
+        "spice": "absürt, kaotik, kara mizah ama anlaşılır",
+        "extreme": True,
+    },
+    "Türkiye Simülasyonu": {
+        "desc": "Bürokrasi, dalgalı ekonomi, 'dayı faktörü' ve yerel sürprizler.",
+        "temperature": 0.85,
+        "spice": "Türkiye bağlamı, yerel gerçeklik, bürokrasi ve piyasa dalgası",
+        "extreme": False,
     },
 }
 
-
-CASES = {
+# Gerçek hayattan esinli vaka sezonları (dramatize / eğitim amaçlı).
+# İster istemez basitleştirilmiştir; bire bir tarihsel döküm değil, "oyunlaştırılmış" versiyon.
+CASE_PRESETS = {
     "Serbest (Rastgele)": {
-        "seed": "",
-        "desc": "Kendi fikrine göre rastgele olaylar.",
+        "seed": None,
+        "brief": "Kendi fikrine göre rastgele olaylar.",
+        "tags": [],
     },
-    "Gerçek vaka esinli: Pazar yeri çöküşü": {
-        "seed": (
-            "Bir marketplace büyüyor ama arz-talep dengesiz. "
-            "Kullanıcılar 'kalite düştü' diyor; tedarikçiler komisyonu suçluyor. "
-            "Bir yandan regülasyon/risk, bir yandan rakip indirimleri."
-        ),
-        "desc": "Marketplace: kalite, komisyon, güven, arz-talep, regülasyon.",
+    "WeWork (IPO Krizi)": {
+        "seed": 2019,
+        "brief": "Aşırı büyüme, yönetişim sorunu, IPO çöküşü sonrası güven ve nakit sıkıntısı.",
+        "tags": ["governance", "burn", "brand"],
     },
-    "Gerçek vaka esinli: Viral büyüme → altyapı yangını": {
-        "seed": (
-            "Ürün bir gecede viral oluyor. Trafik 20x. "
-            "Herkes demo istiyor, support patlıyor, altyapı sürünüyor. "
-            "PR fırsat mı felaket mi?"
-        ),
-        "desc": "Viral büyüme, scale sorunu, support/infra yükü.",
+    "FTX (Şok Çöküş)": {
+        "seed": 2022,
+        "brief": "Hızlı büyüme, güven krizleri, bilanço söylentileri ve ani likidite şoku.",
+        "tags": ["trust", "liquidity", "risk"],
     },
-    "Gerçek vaka esinli: Kurumsal müşterinin 'Excel'e çevirme' baskısı": {
-        "seed": (
-            "Kurumsal müşteri 'AI güzel ama bizde süreç Excel' deyip ürünü Excel'e çevirmeye çalışıyor. "
-            "17 kolonluk istek listesi, rapor talepleri, scope creep."
-        ),
-        "desc": "Enterprise, scope creep, rapor/feature baskısı.",
+    "Quibi (Yanlış Ürün/Dağıtım)": {
+        "seed": 2020,
+        "brief": "Ürün-habit uyumsuzluğu, pahalı içerik, düşük tutunma ve keskin pivot baskısı.",
+        "tags": ["product", "retention", "pivot"],
     },
-    "Gerçek vaka esinli: Yanlış kitle / yanlış algı": {
-        "seed": (
-            "Ürün beklenmedik bir kitle tarafından farklı amaçla kullanılmaya başlanıyor. "
-            "Bir grup bayılıyor, bir grup 'bu dolandırıcılık' diye bağırıyor. "
-            "Mesajın kayıyor, itibar sallanıyor."
-        ),
-        "desc": "Positioning drift, yanlış beklenti, itibar krizi.",
+    "B2B Enterprise Scope Patlaması": {
+        "seed": 404,
+        "brief": "Kurumsal müşteri her şeyi ister; rapor/Excel talepleri ürünü yutar.",
+        "tags": ["enterprise", "scope", "support"],
     },
 }
 
-
-@dataclass
-class Metrics:
-    cash: int
-    mrr: int
-    reputation: int
-    support_load: int
-    infra_load: int
-    churn_pct: float
-
-    def clamp(self) -> "Metrics":
-        self.cash = max(0, int(self.cash))
-        self.mrr = max(0, int(self.mrr))
-        self.reputation = int(max(0, min(100, self.reputation)))
-        self.support_load = int(max(0, min(100, self.support_load)))
-        self.infra_load = int(max(0, min(100, self.infra_load)))
-        self.churn_pct = float(max(0.0, min(25.0, self.churn_pct)))
-        return self
-
-
-DEFAULT_EXPENSES = {
-    "Salaries": 50_000,
-    "Servers": 6_100,
-    "Marketing": 5_300,
+# Metrik aralıkları
+CLAMP = {
+    "reputation": (0, 100),
+    "support_load": (0, 100),
+    "infra_load": (0, 100),
+    "dayi_factor": (0, 100),
+    "churn_pct": (0.0, 25.0),
 }
 
+# Üretim minimum uzunluklar (yetersiz kısa cevapları otomatik uzattırır)
+MIN_LEN_ANALYSIS = 500   # karakter
+MIN_LEN_CRISIS = 550
+MIN_LEN_OUTCOME = 450
 
-# =============================
+
+# =========================
 # Helpers
-# =============================
+# =========================
 
-def pick_api_key() -> Optional[str]:
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def money_fmt(v: int) -> str:
+    # TR biçim: 1.234.567 ₺
+    s = f"{v:,}".replace(",", ".")
+    return f"{s} ₺"
+
+def pct_fmt(v: float) -> str:
+    return f"%{v:.1f}"
+
+def stable_hash(s: str) -> int:
+    # Python hash rastgelelenir; deterministik olsun diye basit
+    h = 2166136261
+    for ch in s:
+        h ^= ord(ch)
+        h *= 16777619
+        h &= 0xFFFFFFFF
+    return int(h)
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+def safe_json_extract(text: str) -> Optional[dict]:
     """
-    Reads Gemini API key from Streamlit secrets or env.
-    Supports:
-      GEMINI_API_KEY = "..."
-      GEMINI_API_KEY = ["key1","key2"]
+    Modelden gelen metinde JSON arar.
+    - ```json ... ``` bloğu
+    - veya ilk {...} dengeli blok
     """
-    key = None
-
-    # Streamlit secrets
-    try:
-        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-            key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        pass
-
-    # Env fallback
-    if key is None:
-        key = os.getenv("GEMINI_API_KEY")
-
-    if isinstance(key, (list, tuple)):
-        key = random.choice([str(k).strip() for k in key if str(k).strip()] or [""])
-    if isinstance(key, str):
-        key = key.strip()
-    return key or None
-
-
-def get_model(mode: str) -> Any:
-    if genai is None:
-        st.error("google-generativeai paketi yok. requirements.txt'e eklemelisin.")
-        st.stop()
-
-    api_key = pick_api_key()
-    if not api_key:
-        st.error("GEMINI_API_KEY bulunamadı. Streamlit Secrets veya env değişkeni olarak ekle.")
-        st.stop()
-
-    genai.configure(api_key=api_key)
-
-    model_name = None
-    try:
-        if hasattr(st, "secrets") and "GEMINI_MODEL" in st.secrets:
-            model_name = st.secrets["GEMINI_MODEL"]
-    except Exception:
-        pass
-    model_name = model_name or os.getenv("GEMINI_MODEL") or "gemini-1.5-flash"
-
-    temp = MODES.get(mode, MODES["Normal"])["temp"]
-    system = (
-        "Sen bir 'startup kriz RPG' yazarı ve ürün stratejisti gibi davranırsın.\n"
-        "Çıktıların Türkçe olacak.\n"
-        "Asla çok kısa geçme; somut detay ve bağlam üret.\n"
-        "Asla kullanıcıya 'seçersen metrikler şöyle olur' diye spoiler verme (etkiler JSON'da saklı).\n"
-    )
-
-    # High token budget to avoid short answers
-    gen_cfg = {
-        "temperature": temp,
-        "top_p": 0.9,
-        "top_k": 40,
-        # Long-form narrative + richer crises/options.
-        "max_output_tokens": 4096,
-    }
-
-    try:
-        return genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system,
-            generation_config=gen_cfg,
-        )
-    except TypeError:
-        # Older SDKs may not support system_instruction
-        return genai.GenerativeModel(
-            model_name=model_name,
-            generation_config=gen_cfg,
-        )
-
-
-def safe_json_loads(text: str) -> Optional[dict]:
     if not text:
         return None
-    text = text.strip()
 
-    # Strip code fences if present
-    if text.startswith("```"):
-        text = text.strip("`")
-        # naive: drop first line marker
-        lines = text.splitlines()
-        if lines:
-            lines = lines[1:]
-        text = "\n".join(lines).strip()
+    # fenced
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.S | re.I)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
 
-    # Find first {...} block if model wrapped extra
-    if not (text.startswith("{") and text.endswith("}")):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            text = text[start : end + 1]
+    # first balanced object (naive)
+    start = text.find("{")
+    if start != -1:
+        # en son }'yi bulup dene; gerekirse küçülterek dene
+        for end in range(len(text) - 1, start, -1):
+            if text[end] != "}":
+                continue
+            snippet = text[start : end + 1]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                continue
 
+    return None
+
+
+# =========================
+# Gemini wrapper (robust)
+# =========================
+
+@dataclass
+class GeminiClient:
+    model_name: str
+    model: Any
+
+def _get_secret_any(key: str) -> Any:
+    # streamlit secrets: st.secrets.get() bazen yoksa KeyError atar
     try:
-        return json.loads(text)
+        return st.secrets.get(key)  # type: ignore
     except Exception:
         return None
 
+def get_gemini_api_key() -> Optional[str]:
+    # 1) env
+    k = os.getenv("GEMINI_API_KEY")
+    if k:
+        return k.strip()
 
-def _word_count(s: str) -> int:
-    return len(re.findall(r"\w+", s or ""))
+    # 2) streamlit secrets
+    k2 = _get_secret_any("GEMINI_API_KEY")
+    if not k2:
+        return None
 
+    # Kullanıcı bazen liste olarak giriyor (TOML). Destekle:
+    if isinstance(k2, list) and k2:
+        return str(k2[0]).strip()
+    return str(k2).strip()
 
-def needs_expansion(month_payload: Dict[str, Any]) -> bool:
-    """Heuristic guardrail: Gemini sometimes returns too-short content."""
+def init_gemini_client() -> Tuple[Optional[GeminiClient], Optional[str]]:
+    """
+    Dönüş: (client, error_message)
+    - NotFound/InvalidArgument durumlarında farklı model isimlerini dener.
+    """
+    if genai is None:
+        return None, "google-generativeai paketi bulunamadı. requirements.txt'e ekleyin: google-generativeai"
+
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return None, "GEMINI_API_KEY bulunamadı. Streamlit Secrets veya ortam değişkeni olarak ekleyin."
+
     try:
-        sit = month_payload["situation"]["text"]
-        kriz = month_payload["crisis"]["text"]
-        a_txt = month_payload["choices"][0]["text"]
-        b_txt = month_payload["choices"][1]["text"]
-    except Exception:
-        return True
+        genai.configure(api_key=api_key)
+    except Exception as e:
+        return None, f"Gemini yapılandırılamadı: {e}"
 
-    # Word-based thresholds (roughly)
-    if _word_count(sit) < 220:
-        return True
-    if _word_count(kriz) < 190:
-        return True
-    if _word_count(a_txt) < 120 or _word_count(b_txt) < 120:
-        return True
-    return False
+    preferred = os.getenv("GEMINI_MODEL") or _get_secret_any("GEMINI_MODEL")
+    candidates: List[str] = []
+    if preferred:
+        candidates.append(str(preferred).strip())
 
+    candidates.extend(DEFAULT_MODEL_CANDIDATES)
 
-def expand_payload_with_gemini(model: Any, base_prompt: str, payload: Dict[str, Any], mode: str) -> Dict[str, Any]:
-    """Second-pass rewrite to enforce richer narrative if the first pass is too short."""
-    try:
-        payload_str = json.dumps(payload, ensure_ascii=False)
-    except Exception:
-        payload_str = str(payload)
+    # Tekilleştir
+    seen = set()
+    uniq: List[str] = []
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        uniq.append(c)
 
-    nudge = f"""
-UYARI: ÇIKTI ÇOK KISA. Aynı yapıyı koruyarak metinleri GENİŞLET.
-
-- Durum Analizi: en az 280 kelime, 3 paragraf (Ay 1 fikir analizi; Ay 2+ önceki seçimlerin etkisi).
-- Kriz: en az 240 kelime, 2-3 paragraf + en sonda 3 madde (riskler / belirsizlik / zaman baskısı).
-- Seçenek metinleri: her biri en az 160 kelime, adım adım ama spoiler yok.
-- Ham metrik sayıları (kasa/MRR vb.) yazma.
-- 'effects' alanlarını DEĞİŞTİRME (aynı kalsın).
-
-ÖNCEKİ JSON:
-{payload_str}
-"""
-    prompt2 = base_prompt + "\n\n" + nudge
-
-    raw2 = model.generate_content(prompt2).text
-    data2 = safe_json_loads(raw2)
-    if isinstance(data2, dict):
-        # Keep effects from original if model messed them up
+    last_err = None
+    for name in uniq:
         try:
-            for i in range(2):
-                if "effects" in payload["choices"][i]:
-                    data2["choices"][i]["effects"] = payload["choices"][i]["effects"]
-        except Exception:
-            pass
-        return data2
-    return payload
+            model = genai.GenerativeModel(name)
+            # tiny ping to validate name (NotFound burada patlar)
+            _ = model.generate_content(
+                "ping",
+                generation_config={"max_output_tokens": 8, "temperature": 0.0},
+            )
+            return GeminiClient(model_name=name, model=model), None
+        except Exception as e:
+            last_err = e
+            continue
 
+    return None, f"Gemini model bulunamadı / erişilemedi. Denenen modeller: {', '.join(uniq)}. Hata: {last_err}"
 
-def clamp_int(x: Any, lo: int, hi: int) -> int:
-    try:
-        v = int(round(float(x)))
-    except Exception:
-        v = lo
-    return max(lo, min(hi, v))
-
-
-def clamp_float(x: Any, lo: float, hi: float) -> float:
-    try:
-        v = float(x)
-    except Exception:
-        v = lo
-    return max(lo, min(hi, v))
-
-
-def summarize_history(months: Dict[str, Any], max_items: int = 8) -> str:
+def gemini_generate(
+    client: GeminiClient,
+    prompt: str,
+    temperature: float = 0.8,
+    max_output_tokens: int = 1300,
+) -> str:
     """
-    Build a compact history string for prompting.
+    NotFound gibi durumlarda yeni model fallback denemek için üst seviyede try/except yapılır.
     """
-    if not months:
-        return "Henüz seçim yapılmadı."
+    resp = client.model.generate_content(
+        prompt,
+        generation_config={
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+        },
+    )
+    # bazı sürümlerde resp.text yok; resp.candidates[0].content.parts...
+    txt = getattr(resp, "text", None)
+    if txt:
+        return str(txt)
 
-    items = []
-    for m in sorted(months.keys(), key=lambda k: int(k)):
-        d = months[m]
-        pick = d.get("picked")
-        note = d.get("free_move") or ""
-        outcome = d.get("outcome_summary") or ""
-        title = d.get("crisis", {}).get("title", "")
-        items.append(
-            f"Ay {m}: kriz='{title}'; seçimin={pick or '-'}; not='{note[:90]}'; sonuç='{outcome[:120]}'"
+    try:
+        parts = resp.candidates[0].content.parts  # type: ignore
+        return "".join(getattr(p, "text", "") for p in parts)
+    except Exception:
+        return str(resp)
+
+
+# =========================
+# Prompt builders
+# =========================
+
+def build_system_context(state: dict) -> str:
+    mode = state["mode"]
+    preset = state["case_preset"]
+    startup = state.get("startup_idea", "")
+    name = state.get("player_name", "İsimsiz Girişimci")
+
+    metrics = state["metrics"]
+    turkey = (mode == "Türkiye Simülasyonu")
+
+    # Geçmiş seçim özeti
+    history_lines = []
+    for h in state.get("choice_history", [])[-6:]:
+        history_lines.append(f"- Ay {h['month']}: {h['choice']} — {h['title']}")
+    history = "\n".join(history_lines) if history_lines else "- (Henüz seçim yok.)"
+
+    preset_brief = CASE_PRESETS.get(preset, CASE_PRESETS["Serbest (Rastgele)"])["brief"]
+
+    # Mode ton ve kurallar
+    tone = MODES[mode]["spice"]
+    extra_tr = ""
+    if turkey:
+        extra_tr = (
+            "\nTürkiye simülasyonu kuralları:\n"
+            "- Olaylar Türkiye bağlamında geçer (bürokrasi, kur farkı, vergiler, tedarik, tahsilat gecikmesi, 'dayı faktörü').\n"
+            "- 'Dayı Faktörü' (0-100) doğru ilişki/bağlantı yönetimini temsil eder; bazen hızlandırır bazen risk yaratır.\n"
         )
 
-    # last N
-    items = items[-max_items:]
-    return "\n".join(items)
-
-
-def build_month_prompt(
-    month: int,
-    mode: str,
-    case_seed: str,
-    player_idea: str,
-    metrics: Metrics,
-    expenses: Dict[str, int],
-    history_text: str,
-    used_crisis_titles: List[str],
-) -> str:
-    mode_directives = MODES.get(mode, MODES["Normal"])["tone_directives"]
-    used_titles = ", ".join([f"'{t}'" for t in used_crisis_titles[-8:]]) or "Yok"
-
-    # Nonce to reduce repetition
-    nonce = random.randint(100000, 999999)
-
-    return f"""
-# ROLE
-Sen bir startup kriz RPG senaryo yazarı + ürün stratejistisin.
-
-# MODE
-Seçilen mod: {mode}
-Mod direktifleri:
-{mode_directives}
-
-# INPUTS
-Ay: {month}
-Rastgele nonce: {nonce}
-
-Vaka tohumu (gerçek vaka esinli olabilir):
-{case_seed}
-
-Oyuncunun girişim fikri (serbest modda ana kaynak):
-{player_idea}
-
-Mevcut metrikler (SENARYODA HAM SAYI YAZMA; sadece arka plan olarak kullan):
-- itibar: {metrics.reputation}/100
-- support yükü: {metrics.support_load}/100
-- altyapı yükü: {metrics.infra_load}/100
-- kayıp oranı (churn): {metrics.churn_pct:.1f}%
-
-Aylık gider kalemleri (ham sayı yazma, sadece arka plan):
-{json.dumps(expenses, ensure_ascii=False)}
-
-Geçmiş özet (Ay 2+ için kullan):
-{history_text}
-
-Daha önce kullanılan kriz başlıkları (BUNLARI TEKRARLAMA):
-{used_titles}
-
-# OUTPUT REQUIREMENTS
-1) SADECE JSON DÖNDÜR. Ek açıklama, markdown, kod bloğu yok.
-2) Durum Analizi uzun ve doyurucu olsun:
-   - Ay 1'de fikir/ürün/pazar/pozisyonlama analizi yap (somut, eleştirel, net).
-   - Ay 2+ ise önceki seçimlerin etkisini anlat; neler iyi gitti, neresi çatladı, hangi yanlış varsayım patladı.
-   - Minimum 260 kelime, hedef 320-420 kelime. 3 paragraf.
-3) Kriz net, somut ve yüksek gerilimli olsun:
-   - Minimum 220 kelime, hedef 260-360 kelime. 2-3 paragraf.
-   - En sonda 3 madde: (1) zaman baskısı (2) yanlış karar riski (3) bir paydaşın (müşteri/influencer/ekip) baskısı.
-4) Seçenekler (A ve B):
-   - Her seçenek için başlık + metin üret.
-   - Metin minimum 160 kelime, hedef 180-240 kelime.
-   - Metinde uygulanabilir adımlar olsun ama 'sonuç/metric etkisi' spoiler verme.
-5) Durum Analizi ve Kriz metninde ham metrik sayıları (kasa/MRR/gider) ASLA yazma.
-6) Tekrar etme: önceki krizlere benzer cümleleri/olayları tekrar kullanma.
-7) JSON şema:
-{{
-  "situation": {{"title": "Durum Analizi", "text": "..."}},
-  "crisis": {{"title": "Kriz", "text": "..."}},
-  "choices": [
-    {{
-      "id": "A",
-      "title": "...",
-      "text": "...",
-      "effects": {{
-        "cash_delta": int,
-        "mrr_delta": int,
-        "reputation_delta": int,
-        "support_delta": int,
-        "infra_delta": int,
-        "churn_delta": float
-      }}
-    }},
-    {{
-      "id": "B",
-      "title": "...",
-      "text": "...",
-      "effects": {{ ... }}
-    }}
-  ],
-  "tags": ["..."]
-}}
-
-# EFFECTS RULES (internal)
-- effects alanları MANTIKLI olsun ve mod zorluğuna göre sertleşsin.
-- difficulty çarpanı: {MODES.get(mode, MODES['Normal'])['difficulty']}
-- cash_delta ve mrr_delta bazen negatif olmalı; her zaman iyi haber yok.
-- churn_delta pozitifse kötü (kayıp artar), negatifse iyi (kayıp azalır).
-"""
-
-
-def apply_effects(metrics: Metrics, effects: Dict[str, Any], expenses_total: int) -> Tuple[Metrics, str]:
-    """
-    Applies one month's economic update:
-      cash += mrr - expenses_total + cash_delta
-      mrr  += mrr_delta
-      other metrics +/- deltas
-    """
-    cash_delta = int(effects.get("cash_delta", 0) or 0)
-    mrr_delta = int(effects.get("mrr_delta", 0) or 0)
-    rep_delta = int(effects.get("reputation_delta", 0) or 0)
-    sup_delta = int(effects.get("support_delta", 0) or 0)
-    inf_delta = int(effects.get("infra_delta", 0) or 0)
-    churn_delta = float(effects.get("churn_delta", 0.0) or 0.0)
-
-    # base cashflow
-    metrics.cash = metrics.cash + metrics.mrr - expenses_total + cash_delta
-    metrics.mrr = metrics.mrr + mrr_delta
-
-    metrics.reputation = metrics.reputation + rep_delta
-    metrics.support_load = metrics.support_load + sup_delta
-    metrics.infra_load = metrics.infra_load + inf_delta
-    metrics.churn_pct = metrics.churn_pct + churn_delta
-
-    metrics.clamp()
-
-    summary = (
-        f"Kasa: {metrics.cash:,} ₺ | MRR: {metrics.mrr:,} ₺ | "
-        f"İtibar: {metrics.reputation}/100 | "
-        f"Support: {metrics.support_load}/100 | "
-        f"Altyapı: {metrics.infra_load}/100 | "
-        f"Kayıp Oranı: %{metrics.churn_pct:.1f}"
+    # Metrikleri modele bağlam olarak veririz ama metinde TEKRAR yazdırmayız (kullanıcı istemiyor)
+    metrics_ctx = (
+        f"Kasa: {metrics['cash']} TL, MRR: {metrics['mrr']} TL, "
+        f"Kayıp Oranı (churn): {metrics['churn_pct']}%, "
+        f"İtibar: {metrics['reputation']}/100, Destek yükü: {metrics['support_load']}/100, "
+        f"Altyapı yükü: {metrics['infra_load']}/100"
+        + (f", Dayı Faktörü: {metrics['dayi_factor']}/100" if turkey else "")
     )
-    return metrics, summary
+
+    return textwrap.dedent(
+        f"""
+        Sen bir startup simülasyonu anlatıcısısın. Dil: Türkçe.
+        Oyuncu: {name}
+        Mod: {mode} ({tone})
+        Vaka sezonağı: {preset} — {preset_brief}
+
+        Kurallar:
+        - "Durum Analizi" bölümünü her ay üret.
+          * Ay 1: oyuncunun girişim fikrini güçlü/zayıf yönleriyle derin analiz et (pazar, farklılaşma, riskler, ilk 30 gün).
+          * Ay 2+: bir önceki ay seçiminin sonuçlarını ve biriken ikinci-order etkileri analiz et (takım, ürün, satış, PR, operasyon).
+        - "Kriz" bölümü: net, sahneli, anlaşılır, somut bir kriz anlat.
+          * 2-4 paragraf olsun; neden şimdi patladı, kimler baskı yapıyor, oyuncu neyi kaybedebilir?
+          * Metrikleri/numaraları metinde sayma (kullanıcı istemiyor). Metrikler sadece arka plan.
+        - Sonra A/B seçenekleri üret:
+          * Her seçenek: başlık + 3-6 maddelik "ne yaparsın" planı.
+          * Seçenek metninde "bunu seçersen MRR artar/support düşer" gibi spoiler sonuç yazma.
+          * Seçenekler benzer uzunlukta olsun.
+        - Extreme moddaysan: olaylar daha absürt/kaotik/komik ama HALA anlaşılır ve kararın bedeli ağır.
+        - Her ay yeni bir olay olsun; aynı krizi tekrar etme.
+
+        Oyuncunun girişim fikri:
+        {startup}
+
+        Son seçimlerin özeti:
+        {history}
+
+        Arka plan metrikleri (metinde tekrar yazma, sadece bağlam): {metrics_ctx}
+        {extra_tr}
+        """
+    ).strip()
+
+def month_bundle_prompt(state: dict, month: int) -> str:
+    ctx = build_system_context(state)
+    mode = state["mode"]
+    preset = state["case_preset"]
+    # Gerçek vaka taglerini prompta ekleyelim
+    tags = CASE_PRESETS.get(preset, CASE_PRESETS["Serbest (Rastgele)"]).get("tags", [])
+    tag_line = ", ".join(tags) if tags else ""
+
+    return textwrap.dedent(
+        f"""
+        {ctx}
+
+        Şimdi Ay {month} içeriğini ÜRET ve SADECE aşağıdaki JSON'u döndür (başka metin ekleme):
+
+        {{
+          "month": {month},
+          "analysis": "string",
+          "crisis": "string",
+          "options": {{
+            "A": {{"title":"string","steps":["..."]}},
+            "B": {{"title":"string","steps":["..."]}}
+          }},
+          "case_reference": "string (opsiyonel, 1 cümle; gerçek hayattan esin varsa imalı şekilde)"
+        }}
+
+        Ek koşullar:
+        - analysis en az {MIN_LEN_ANALYSIS} karakter, crisis en az {MIN_LEN_CRISIS} karakter olsun.
+        - steps maddeleri kısa ama net olsun (1 cümle).
+        - {mode=} {tag_line=}
+        """
+    ).strip()
+
+def outcome_prompt(state: dict, month: int, chosen: str, free_action: str = "") -> str:
+    ctx = build_system_context(state)
+    mode = state["mode"]
+    turkey = (mode == "Türkiye Simülasyonu")
+
+    extra_metrics = ""
+    if turkey:
+        extra_metrics = ', "dayi_factor_delta": -10'
+
+    # Seçim başlığı ve adımlar
+    bundle = state["current_bundle"]
+    opt = bundle["options"][chosen]
+    title = opt["title"]
+    steps = opt["steps"]
+
+    free_line = ""
+    if free_action.strip():
+        free_line = f'\nOyuncunun ekstra hamlesi (not): "{free_action.strip()}"\n'
+
+    return textwrap.dedent(
+        f"""
+        {ctx}
+
+        Ay {month} için oyuncu seçimi: {chosen}) {title}
+        Plan maddeleri:
+        {chr(10).join([f"- {s}" for s in steps])}
+        {free_line}
+
+        Şimdi bu seçimin AY SONU SONUÇLARINI yaz ve SADECE aşağıdaki JSON'u döndür (başka metin ekleme):
+
+        {{
+          "outcome": "string (en az {MIN_LEN_OUTCOME} karakter, 2-4 paragraf; somut sonuçlar + 1 tane sürpriz yan etki)",
+          "deltas": {{
+            "cash_delta": -50000,
+            "mrr_delta": 1000,
+            "reputation_delta": 5,
+            "churn_pct_delta": -0.4,
+            "support_load_delta": -3,
+            "infra_load_delta": 2{extra_metrics}
+          }},
+          "headline": "string (kısa başlık)"
+        }}
+
+        Kurallar:
+        - outcome metninde yine metrik/numara sayma; sadece etkileri hikaye içinde anlat.
+        - Extreme moddaysan absürt detay ekle ama sonucu ciddiye al.
+        - Kasa/MRR gibi rakamlar UI'da zaten var; metinde spoiler sayma.
+        """
+    ).strip()
 
 
-# =============================
-# Session state
-# =============================
+# =========================
+# Offline fallback content (no API)
+# =========================
 
-def init_state():
-    if "initialized" in st.session_state:
+def offline_bundle(state: dict, month: int) -> dict:
+    rnd = random.Random(state["seed"] + month * 101)
+    idea = state.get("startup_idea", "bir uygulama")
+    base = f"Ay {month}. {idea} etrafında işler karışıyor."
+    analysis = (
+        f"{base}\n\n"
+        "Durum Analizi: Şu an en büyük risk 'netlik'. Kullanıcılar seni duyuyor ama aynı şeyi anlamıyor. "
+        "Bu ay tek bir cümlelik değer önermesini kilitlemezsen ürün iyi olsa bile anlaşılmayacak.\n\n"
+        "Ayrıca ekip içinde hız/kalite gerilimi büyüyor: bir taraf 'büyüme zamanı' diye tempo tutuyor, "
+        "diğer taraf 'önce anlaşılır olalım' diye fren basıyor."
+    )
+    crisis = (
+        "Kriz: Bir kurumsal müşteri demo sonrası 'Biz bunu kendi sürecimize uydururuz' deyip ürünü Excel'e çevirmeye kalkıyor. "
+        "Aynı anda sosyal medyada bir paylaşım ürününü bambaşka bir amaçla konumlandırıyor ve destek hattın 'bu böyle mi çalışmalı?' "
+        "sorularıyla doluyor. Bu ay bir karar vermezsen, herkes seni kendi hikayesine çevirip ürün algını paramparça edecek."
+    )
+
+    optA = {
+        "title": "Tek cümle protokolü",
+        "steps": [
+            "Tek cümlelik değer önermesini yaz ve ekipte kilitle.",
+            "Onboarding'i 3 ekrana indir; ilk dakikada tek başarı anı.",
+            "Kurumsal istekleri 1 sayfalık 'kapsam notu'na bağla.",
+            "SSS + hazır cevaplarla destek hattını düzene sok.",
+        ],
+    }
+    optB = {
+        "title": "Çift kulvar planı",
+        "steps": [
+            "Ürünü iki akışa ayır: hızlı kullanım / derin kullanım.",
+            "Girişte tek soru sor ve akışı ona göre aç.",
+            "Kurumsala şablon rapor paketini hazırla; özel istekleri sıraya al.",
+            "Ürün anlatımını iki persona için netleştir.",
+        ],
+    }
+    # küçük varyasyon
+    if rnd.random() < 0.5:
+        optA["steps"].append("Web sitesini tek vaat etrafında yeniden yaz.")
+        optB["steps"].append("Toplulukta dolaşan yanlış kullanım örneklerini düzelt.")
+
+    return {
+        "month": month,
+        "analysis": analysis,
+        "crisis": crisis,
+        "options": {"A": optA, "B": optB},
+        "case_reference": "Offline demo (API yok).",
+    }
+
+def offline_outcome(state: dict, month: int, chosen: str) -> dict:
+    rnd = random.Random(state["seed"] + month * 999 + (1 if chosen == "A" else 2))
+    if chosen == "A":
+        headline = "Netlik geldi, gürültü azaldı"
+        outcome = (
+            "Bir haftada herkesin diline aynı cümleyi yerleştirdin. Demo'larda farklı ekipler farklı şeyler istemeye çalışsa da "
+            "sen aynı yere dönüp 'bizim ürün şunu yapar' diye çerçeveledin. Destek hattındaki sorular azaldı çünkü artık insanlar "
+            "ne aldığını daha iyi anlıyor.\n\n"
+            "Sürpriz: Netlik bazı yanlış kitleyi ürküttü; sosyalde 'eskisi kadar gizemli değil' diye tuhaf bir eleştiri çıktı ama "
+            "bu gürültü seni aslında temizledi."
+        )
+        deltas = {
+            "cash_delta": -45000,
+            "mrr_delta": 1200,
+            "reputation_delta": 6,
+            "churn_pct_delta": -0.6,
+            "support_load_delta": -6,
+            "infra_load_delta": 1,
+        }
+    else:
+        headline = "İki kulvar açıldı, kontrol zorlaştı"
+        outcome = (
+            "Hızlı kullanıcılar 'hemen iş görsün' akışını sevdi, derin kullanıcılar da kontrol modunda vakit geçirmeye başladı. "
+            "Bu sayede ürün tek bir kalıba sıkışmadı; farklı segmentlerden geri bildirim topladın.\n\n"
+            "Sürpriz: İki akış, ekip içinde iki ayrı ürün gibi algılandı ve roadmap toplantıları uzadı. Doğru yönetişim koymazsan "
+            "bir sonraki ay 'iki ürün, iki kriz' yaşayabilirsin."
+        )
+        deltas = {
+            "cash_delta": -60000,
+            "mrr_delta": 900,
+            "reputation_delta": 3,
+            "churn_pct_delta": -0.2,
+            "support_load_delta": -2,
+            "infra_load_delta": 4,
+        }
+
+    # small randomness
+    deltas["reputation_delta"] += rnd.choice([0, 1, -1])
+    return {"headline": headline, "outcome": outcome, "deltas": deltas}
+
+
+# =========================
+# Game state
+# =========================
+
+def default_metrics(mode: str, starting_cash: int) -> dict:
+    base = {
+        "cash": int(starting_cash),
+        "mrr": 0,
+        "churn_pct": 5.0,
+        "reputation": 50,
+        "support_load": 20,
+        "infra_load": 20,
+        "dayi_factor": 35 if mode == "Türkiye Simülasyonu" else 0,
+    }
+    # Mod ayarı
+    if mode == "Hard":
+        base["churn_pct"] = 6.0
+        base["support_load"] = 25
+        base["infra_load"] = 25
+        base["reputation"] = 45
+    if mode == "Spartan":
+        base["cash"] = int(starting_cash * 0.7)
+        base["support_load"] = 30
+        base["infra_load"] = 30
+    if mode == "Extreme":
+        base["churn_pct"] = 7.5
+    return base
+
+def init_state() -> dict:
+    seed = int(time.time()) ^ random.randint(0, 999999)
+    return {
+        "seed": seed,
+        "phase": "setup",  # setup | playing | finished
+        "month": 1,
+        "season_len": 12,
+        "mode": "Normal",
+        "case_preset": "Serbest (Rastgele)",
+        "player_name": "İsimsiz Girişimci",
+        "startup_idea": "",
+        "metrics": default_metrics("Normal", 1_000_000),
+        "monthly_spend": {"Salaries": 50000, "Servers": 6100, "Marketing": 5300},
+        "messages": [],  # chat history: list[{role, content}]
+        "choice_history": [],  # list[{month, choice, title}]
+        "current_bundle": None,
+        "bundle_posted": False,
+        "gemini_model_used": None,
+    }
+
+
+# =========================
+# Month generation & progression (no duplicates)
+# =========================
+
+def ensure_bundle(state: dict) -> None:
+    """Generate month bundle if missing. Does NOT append to chat. (append is separate & guarded)"""
+    if state["current_bundle"] is not None:
         return
 
-    st.session_state.initialized = True
-    st.session_state.started = False
-    st.session_state.mode = "Normal"
-    st.session_state.case_name = "Serbest (Rastgele)"
-    st.session_state.season_months = 12
+    month = state["month"]
 
-    st.session_state.player_name = "İsimsiz Girişimci"
-    st.session_state.idea = ""
+    # deterministic per month + preset
+    preset_seed = CASE_PRESETS.get(state["case_preset"], CASE_PRESETS["Serbest (Rastgele)"])["seed"]
+    base_seed = state["seed"]
+    if preset_seed is not None:
+        base_seed = stable_hash(f"{preset_seed}-{state['seed']}-{state.get('startup_idea','')}")
+    random.seed(base_seed + month * 10007)
 
-    st.session_state.expenses = DEFAULT_EXPENSES.copy()
-    st.session_state.metrics = Metrics(
-        cash=1_000_000,
-        mrr=0,
-        reputation=50,
-        support_load=20,
-        infra_load=20,
-        churn_pct=5.0,
+    client, err = st.session_state.get("_gemini_client"), st.session_state.get("_gemini_err")
+    if client is None and err is None:
+        client, err = init_gemini_client()
+        st.session_state["_gemini_client"] = client
+        st.session_state["_gemini_err"] = err
+
+    if client is None:
+        # Offline fallback
+        state["current_bundle"] = offline_bundle(state, month)
+        state["bundle_posted"] = False
+        return
+
+    # Build prompt, call model, parse JSON, retry once if too short
+    prompt = month_bundle_prompt(state, month)
+    temperature = MODES[state["mode"]]["temperature"]
+
+    def _try(prompt_text: str) -> Optional[dict]:
+        try:
+            raw = gemini_generate(client, prompt_text, temperature=temperature, max_output_tokens=1700)
+            data = safe_json_extract(raw)
+            return data
+        except Exception as e:
+            # If NotFound, reset client for next time
+            if gexc and isinstance(e, gexc.NotFound):
+                st.session_state["_gemini_client"] = None
+                st.session_state["_gemini_err"] = None
+            raise
+
+    try:
+        data = _try(prompt)
+        if not data:
+            # second attempt: explicitly ask for JSON only
+            data = _try(prompt + "\n\nSADECE JSON döndür. Açıklama ekleme.")
+        if not data:
+            raise RuntimeError("Model JSON üretmedi.")
+
+        # validate & normalize
+        data.setdefault("month", month)
+        if "options" not in data or "A" not in data["options"] or "B" not in data["options"]:
+            raise RuntimeError("JSON formatı beklenen yapıda değil (options/A/B).")
+
+        # length guard
+        if len(str(data.get("analysis", ""))) < MIN_LEN_ANALYSIS or len(str(data.get("crisis", ""))) < MIN_LEN_CRISIS:
+            # retry once: force longer
+            data2 = _try(prompt + f"\n\nNot: analysis>={MIN_LEN_ANALYSIS} ve crisis>={MIN_LEN_CRISIS} olacak şekilde daha uzun yaz.")
+            if data2:
+                data = data2
+
+        state["current_bundle"] = data
+        state["bundle_posted"] = False
+        state["gemini_model_used"] = client.model_name
+
+    except Exception as e:
+        # UI'da kırmızı stack yerine anlaşılır hata
+        state["current_bundle"] = offline_bundle(state, month)
+        state["bundle_posted"] = False
+        st.warning(f"Model çağrısı başarısız oldu; offline moda düştüm. (Hata: {e})")
+
+def post_bundle_to_chat(state: dict) -> None:
+    """Append analysis + crisis once per month (guarded by bundle_posted)."""
+    if state["current_bundle"] is None or state["bundle_posted"]:
+        return
+
+    b = state["current_bundle"]
+    m = b.get("month", state["month"])
+    analysis = str(b.get("analysis", "")).strip()
+    crisis = str(b.get("crisis", "")).strip()
+    case_ref = str(b.get("case_reference", "")).strip()
+
+    # Chat messages (assistant)
+    state["messages"].append({"role": "assistant", "content": f"🧠 **Durum Analizi (Ay {m})**\n\n{analysis}"})
+    state["messages"].append({"role": "assistant", "content": f"⚠️ **Kriz**\n\n{crisis}"})
+    if case_ref:
+        state["messages"].append({"role": "assistant", "content": f"🗂️ _Vaka notu:_ {case_ref}"})
+
+    state["messages"].append(
+        {"role": "assistant", "content": "👉 **Şimdi seçim zamanı. A mı B mi?** (İstersen aşağıya kısa bir not da ekleyebilirsin.)"}
     )
+    state["bundle_posted"] = True
 
-    # Month payloads: { "1": {...}, "2": {...} }
-    st.session_state.months: Dict[str, Any] = {}
+def apply_deltas(state: dict, deltas: dict) -> None:
+    m = state["metrics"]
 
-    # Chat messages: list[ {id, role, content} ]
-    st.session_state.chat: List[Dict[str, str]] = []
+    m["cash"] = int(m["cash"] + int(deltas.get("cash_delta", 0)))
+    m["mrr"] = int(max(0, m["mrr"] + int(deltas.get("mrr_delta", 0))))
 
-    st.session_state.current_month = 1
+    m["reputation"] = int(clamp(m["reputation"] + int(deltas.get("reputation_delta", 0)), *CLAMP["reputation"]))
+    m["support_load"] = int(clamp(m["support_load"] + int(deltas.get("support_load_delta", 0)), *CLAMP["support_load"]))
+    m["infra_load"] = int(clamp(m["infra_load"] + int(deltas.get("infra_load_delta", 0)), *CLAMP["infra_load"]))
+    m["churn_pct"] = float(clamp(m["churn_pct"] + float(deltas.get("churn_pct_delta", 0.0)), *CLAMP["churn_pct"]))
+
+    if state["mode"] == "Türkiye Simülasyonu":
+        m["dayi_factor"] = int(clamp(m["dayi_factor"] + int(deltas.get("dayi_factor_delta", 0)), *CLAMP["dayi_factor"]))
+
+    # burn (aylık gider)
+    burn = sum(int(v) for v in state["monthly_spend"].values())
+    m["cash"] = int(m["cash"] - burn)
+
+def resolve_choice(state: dict, chosen: str, free_action: str = "") -> None:
+    bundle = state["current_bundle"]
+    month = state["month"]
+
+    title = bundle["options"][chosen]["title"]
+    state["choice_history"].append({"month": month, "choice": chosen, "title": title})
+
+    # user message
+    user_line = f"{chosen}) {title}"
+    if free_action.strip():
+        user_line += f"\n\n_Not:_ {free_action.strip()}"
+    state["messages"].append({"role": "user", "content": user_line})
+
+    # outcome via model
+    client = st.session_state.get("_gemini_client")
+    err = st.session_state.get("_gemini_err")
+
+    if client is None:
+        out = offline_outcome(state, month, chosen)
+        state["messages"].append({"role": "assistant", "content": f"✅ **{out['headline']}**\n\n{out['outcome']}"})
+        apply_deltas(state, out["deltas"])
+    else:
+        temperature = MODES[state["mode"]]["temperature"]
+        prompt = outcome_prompt(state, month, chosen, free_action=free_action)
+
+        def _try(prompt_text: str) -> Optional[dict]:
+            raw = gemini_generate(client, prompt_text, temperature=temperature, max_output_tokens=1400)
+            return safe_json_extract(raw)
+
+        try:
+            data = _try(prompt)
+            if not data:
+                data = _try(prompt + "\n\nSADECE JSON döndür.")
+            if not data:
+                raise RuntimeError("Model outcome JSON üretmedi.")
+
+            if len(str(data.get("outcome", ""))) < MIN_LEN_OUTCOME:
+                data2 = _try(prompt + f"\n\nNot: outcome>={MIN_LEN_OUTCOME} olacak şekilde daha uzun yaz.")
+                if data2:
+                    data = data2
+
+            headline = str(data.get("headline", "Seçim işlendi")).strip()
+            outcome_txt = str(data.get("outcome", "")).strip()
+            deltas = data.get("deltas", {}) if isinstance(data.get("deltas"), dict) else {}
+
+            state["messages"].append({"role": "assistant", "content": f"✅ **{headline}**\n\n{outcome_txt}"})
+            apply_deltas(state, deltas)
+
+        except Exception as e:
+            # NotFound gibi durumlarda kullanıcıya çözüm yolu göster
+            if gexc and isinstance(e, gexc.NotFound):
+                st.error(
+                    "Gemini model NotFound hatası: Model adı/erişimi yanlış görünüyor.\n\n"
+                    "Çözüm: Streamlit Secrets içine `GEMINI_MODEL=\"gemini-1.5-flash\"` (veya pro) ekle, "
+                    "ya da ortam değişkeni olarak ayarla. Sonra app'i yeniden başlat."
+                )
+                # client'ı sıfırla ki fallback denesin
+                st.session_state["_gemini_client"] = None
+                st.session_state["_gemini_err"] = None
+
+            state["messages"].append(
+                {"role": "assistant", "content": f"⚠️ Model tarafında hata oldu; offline sonuç ürettim. (Hata: {e})"}
+            )
+            out = offline_outcome(state, month, chosen)
+            state["messages"].append({"role": "assistant", "content": f"✅ **{out['headline']}**\n\n{out['outcome']}"})
+            apply_deltas(state, out["deltas"])
+
+    # next month
+    state["month"] += 1
+    state["current_bundle"] = None
+    state["bundle_posted"] = False
+
+    if state["month"] > state["season_len"]:
+        state["phase"] = "finished"
+        state["messages"].append({"role": "assistant", "content": "🏁 Sezon bitti. İstersen oyunu sıfırlayıp yeni vaka seçebilirsin."})
 
 
-def reset_game(keep_settings: bool = True):
-    mode = st.session_state.get("mode", "Normal")
-    case_name = st.session_state.get("case_name", "Serbest (Rastgele)")
-    season = st.session_state.get("season_months", 12)
-    player_name = st.session_state.get("player_name", "İsimsiz Girişimci")
+# =========================
+# UI
+# =========================
 
-    init_state()
-    st.session_state.started = False
-    st.session_state.idea = ""
-    st.session_state.months = {}
-    st.session_state.chat = []
-    st.session_state.current_month = 1
-    st.session_state.metrics = Metrics(
-        cash=int(st.session_state.metrics.cash),
-        mrr=0,
-        reputation=50,
-        support_load=20,
-        infra_load=20,
-        churn_pct=5.0,
-    )
-
-    if keep_settings:
-        st.session_state.mode = mode
-        st.session_state.case_name = case_name
-        st.session_state.season_months = season
-        st.session_state.player_name = player_name
-
-
-def add_chat_message(msg_id: str, role: str, content: str):
-    """
-    Avoid duplicates on rerun: msg_id should be stable (month-kind).
-    """
-    for m in st.session_state.chat:
-        if m.get("id") == msg_id:
-            return
-    st.session_state.chat.append({"id": msg_id, "role": role, "content": content})
-
-
-# =============================
-# Rendering helpers
-# =============================
-
-def inject_css():
+def inject_css() -> None:
     st.markdown(
         """
-<style>
-/* Dark-ish theme polish */
-.block-container { padding-top: 1.2rem; }
-div[data-testid="stSidebar"] .stSelectbox label, 
-div[data-testid="stSidebar"] .stSlider label,
-div[data-testid="stSidebar"] .stTextInput label,
-div[data-testid="stSidebar"] .stTextArea label { font-weight: 600; }
+        <style>
+          .big-title { font-size: 46px; font-weight: 800; margin: 0 0 6px 0; }
+          .subtitle { opacity: .75; margin-bottom: 16px; }
 
-.choice-wrap { margin-top: 0.75rem; }
-.choice-card {
-  border: 1px solid rgba(255,255,255,0.10);
-  border-radius: 14px;
-  padding: 18px 18px 14px 18px;
-  background: rgba(255,255,255,0.02);
-}
-.choice-title {
-  font-size: 1.35rem;
-  font-weight: 800;
-  margin-bottom: 10px;
-}
-.choice-body {
-  font-size: 0.98rem;
-  line-height: 1.45;
-  opacity: 0.95;
-  min-height: 150px;
-}
+          /* Choice cards */
+          .choice-card {
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 18px 18px 14px 18px;
+            background: rgba(255,255,255,0.02);
+            min-height: 260px;
+          }
+          .choice-title { font-size: 22px; font-weight: 800; margin-bottom: 10px; }
+          .choice-steps { opacity: .9; }
+          .choice-steps li { margin-bottom: 6px; }
 
-.choice-btn-row .stButton button {
-  width: 100%;
-  border-radius: 12px;
-  padding: 10px 14px;
-}
-
-.small-note { opacity: 0.75; font-size: 0.9rem; }
-
-</style>
-""",
+          /* Sidebar small labels */
+          .metric-label { opacity: .7; font-size: 12px; }
+          .metric-value { font-size: 26px; font-weight: 800; margin-top: -4px; }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
 
-
-def render_sidebar():
+def sidebar(state: dict) -> None:
     with st.sidebar:
-        st.title(st.session_state.player_name)
+        st.markdown(f"### {state['player_name']}")
+        mode = st.selectbox("Mod", list(MODES.keys()), index=list(MODES.keys()).index(state["mode"]))
+        state["mode"] = mode
 
-        # Mode first (requested: mod above "calendar/season")
-        mode = st.selectbox(
-            "Mod",
-            list(MODES.keys()),
-            index=list(MODES.keys()).index(st.session_state.mode),
-            help="Mod senaryonun tonu ve zorluğunu değiştirir.",
-        )
-        st.session_state.mode = mode
         st.caption(MODES[mode]["desc"])
 
-        case_name = st.selectbox(
-            "Vaka sezonu (opsiyonel)",
-            list(CASES.keys()),
-            index=list(CASES.keys()).index(st.session_state.case_name),
-            help="Gerçek hayattan esinli bir başlangıç tohumu seçebilirsin.",
-        )
-        st.session_state.case_name = case_name
-        st.caption(CASES[case_name]["desc"])
+        preset = st.selectbox("Vaka sezonu (opsiyonel)", list(CASE_PRESETS.keys()), index=list(CASE_PRESETS.keys()).index(state["case_preset"]))
+        state["case_preset"] = preset
+        st.caption(CASE_PRESETS[preset]["brief"])
 
-        season_months = st.slider(
-            "Sezon uzunluğu (ay)",
-            min_value=3,
-            max_value=24,
-            value=int(st.session_state.season_months),
-        )
-        st.session_state.season_months = int(season_months)
+        season_len = st.slider("Sezon uzunluğu (ay)", min_value=6, max_value=24, value=int(state["season_len"]), step=1)
+        state["season_len"] = season_len
 
-        st.write(f"Ay: {st.session_state.current_month}/{st.session_state.season_months}")
-        st.progress(min(1.0, st.session_state.current_month / max(1, st.session_state.season_months)))
+        st.caption(f"Ay: {min(state['month'], state['season_len'])}/{state['season_len']}")
 
-        start_cash = st.slider(
-            "Başlangıç kasası",
-            min_value=50_000,
-            max_value=2_000_000,
-            step=10_000,
-            value=int(st.session_state.metrics.cash) if not st.session_state.started else int(st.session_state.metrics.cash),
-            disabled=st.session_state.started,
-        )
-        if not st.session_state.started:
-            st.session_state.metrics.cash = int(start_cash)
+        starting_cash = st.slider("Başlangıç kasası", min_value=100_000, max_value=2_000_000, value=int(state["metrics"]["cash"]) if state["phase"] == "setup" else int(state["metrics"]["cash"]), step=50_000)
+        if state["phase"] == "setup":
+            # setup aşamasında başlangıç kasası metriklerini ayarlasın
+            state["metrics"] = default_metrics(state["mode"], starting_cash)
 
-        # Financial status
-        st.subheader("Finansal Durum")
-        st.metric("Kasa", f"{st.session_state.metrics.cash:,} ₺")
-        st.metric("MRR", f"{st.session_state.metrics.mrr:,} ₺")
+        st.markdown("---")
+        st.markdown("### Finansal Durum")
 
-        with st.expander("Aylık Gider Detayı", expanded=False):
-            st.markdown(
-                "\n".join(
-                    [
-                        f"- Maaşlar: {DEFAULT_EXPENSES['Salaries']:,} ₺",
-                        f"- Sunucu: {DEFAULT_EXPENSES['Servers']:,} ₺",
-                        f"- Pazarlama: {DEFAULT_EXPENSES['Marketing']:,} ₺",
-                        f"**TOPLAM:** {sum(DEFAULT_EXPENSES.values()):,} ₺",
-                    ]
-                )
-            )
+        m = state["metrics"]
+        st.markdown(f"<div class='metric-label'>Kasa</div><div class='metric-value'>{money_fmt(int(m['cash']))}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='metric-label'>MRR</div><div class='metric-value'>{money_fmt(int(m['mrr']))}</div>", unsafe_allow_html=True)
 
-        st.divider()
-        st.write(f"İtibar: {st.session_state.metrics.reputation}/100")
-        st.write(f"Support yükü: {st.session_state.metrics.support_load}/100")
-        st.write(f"Altyapı yükü: {st.session_state.metrics.infra_load}/100")
-        st.write(f"Kayıp Oranı: %{st.session_state.metrics.churn_pct:.1f}")
+        with st.expander("Aylık Gider Detayı"):
+            sp = state["monthly_spend"]
+            st.write(f"• Maaşlar: {money_fmt(int(sp['Salaries']))}")
+            st.write(f"• Sunucu: {money_fmt(int(sp['Servers']))}")
+            st.write(f"• Pazarlama: {money_fmt(int(sp['Marketing']))}")
+            st.write(f"**TOPLAM:** {money_fmt(int(sum(sp.values())))}")
 
-        st.divider()
-        if st.button("Oyunu sıfırla", use_container_width=True):
-            reset_game(keep_settings=True)
-            st.rerun()
+        st.markdown("---")
+        st.markdown(f"**İtibar:** {m['reputation']}/100")
+        st.markdown(f"**Destek yükü:** {m['support_load']}/100")
+        st.markdown(f"**Altyapı yükü:** {m['infra_load']}/100")
+        st.markdown(f"**Kayıp oranı:** {pct_fmt(m['churn_pct'])}")
+
+        if state["mode"] == "Türkiye Simülasyonu":
+            st.markdown(f"**Dayı faktörü:** {m['dayi_factor']}/100")
+
+        st.markdown("---")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Oyunu sıfırla", use_container_width=True):
+                st.session_state["game_state"] = init_state()
+                st.rerun()
+        with col_b:
+            if st.button("Sohbeti temizle", use_container_width=True):
+                state["messages"] = []
+                st.rerun()
 
 
-def render_header():
-    # Character customize on top-right-ish
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        st.markdown("# Startup Survivor RPG")
-        st.caption("Sohbet akışı korunur. Ay 1'den başlar. Durum Analizi → Kriz → A/B seçimi.")
-    with c2:
-        with st.expander("🛠️ Karakterini ve ayarlarını özelleştir (Tıkla)", expanded=False):
-            player_name = st.text_input("Karakter adı", value=st.session_state.player_name, max_chars=32)
-            if player_name.strip():
-                st.session_state.player_name = player_name.strip()
-            st.caption("Not: Oyuna başladıktan sonra adı değiştirebilirsin.")
+def top_bar(state: dict) -> None:
+    left, right = st.columns([8, 4], vertical_alignment="top")
+    with left:
+        st.markdown(f"<div class='big-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='subtitle'>{APP_SUBTITLE}</div>", unsafe_allow_html=True)
+    with right:
+        with st.expander("🛠️ Karakterini ve ayarlarını özelleştir", expanded=False):
+            state["player_name"] = st.text_input("Karakter adı", value=state["player_name"])
+            # Bu alanlar oyun mekaniği değil; rol hissi için
+            st.text_input("Rol (opsiyonel)", value=st.session_state.get("role", "Kurucu"))
+            st.text_input("Ekip stili (opsiyonel)", value=st.session_state.get("team_style", "Küçük ama hızlı"))
 
-
-def render_chat():
-    # Render chat in order
-    for msg in st.session_state.chat:
+def render_chat(state: dict) -> None:
+    for msg in state["messages"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+def render_setup(state: dict) -> None:
+    st.info("Oyuna başlamak için girişim fikrini yaz. Sonra Ay 1 başlar (Durum Analizi → Kriz → A/B).")
+    idea = st.text_area("Girişim fikrin ne?", value=state.get("startup_idea", ""), height=120, placeholder="Örn: Anlık çeviri yapan bir uygulama...")
+    state["startup_idea"] = idea
 
-# =============================
-# Game logic
-# =============================
+    # API durumu
+    client = st.session_state.get("_gemini_client")
+    err = st.session_state.get("_gemini_err")
+    if client is None and err is None:
+        client, err = init_gemini_client()
+        st.session_state["_gemini_client"] = client
+        st.session_state["_gemini_err"] = err
 
-def get_case_seed(case_name: str, idea: str) -> str:
-    seed = CASES.get(case_name, CASES["Serbest (Rastgele)"]).get("seed", "")
-    if case_name == "Serbest (Rastgele)":
-        return ""
-    # If user also has an idea, we can blend it lightly
-    if idea.strip():
-        return seed + "\n\nOyuncunun fikri (vaka içine harmanla):\n" + idea.strip()
-    return seed
+    if client:
+        st.success(f"✅ Gemini anahtarı görüldü. Model çağrıları çalışmalı. (Model: {client.model_name})")
+    else:
+        st.warning(f"⚠️ Gemini kapalı: {err}\n\nİstersen offline demo ile devam edebilirsin.")
 
+    if st.button("🚀 Oyunu Başlat", type="primary", use_container_width=True, disabled=not idea.strip()):
+        # reset and start
+        seed = state["seed"]
+        mode = state["mode"]
+        preset = state["case_preset"]
+        season_len = state["season_len"]
+        cash = state["metrics"]["cash"]
 
-def ensure_month_generated(month: int):
-    """
-    Generate month content once, store it. Also append chat messages once.
-    """
-    if str(month) in st.session_state.months:
-        # Already generated; ensure messages exist (dedupe makes it safe)
-        payload = st.session_state.months[str(month)]
-        add_chat_message(f"{month}-situation", "assistant", f"🧠 **{payload['situation']['title']} (Ay {month})**\n\n{payload['situation']['text']}")
-        add_chat_message(f"{month}-crisis", "assistant", f"⚠️ **{payload['crisis']['title']}**\n\n{payload['crisis']['text']}")
+        st.session_state["game_state"] = init_state()
+        st.session_state["game_state"].update({
+            "seed": seed,
+            "mode": mode,
+            "case_preset": preset,
+            "season_len": season_len,
+            "player_name": state["player_name"],
+            "startup_idea": idea,
+            "metrics": default_metrics(mode, cash),
+            "phase": "playing",
+            "month": 1,
+        })
+        st.rerun()
+
+def render_choice_ui(state: dict) -> None:
+    bundle = state["current_bundle"]
+    if not bundle:
         return
 
-    mode = st.session_state.mode
-    idea = st.session_state.idea.strip()
-    case_seed = get_case_seed(st.session_state.case_name, idea)
-    history = summarize_history(st.session_state.months)
-    used_titles = [st.session_state.months[k]["crisis"]["title"] for k in sorted(st.session_state.months.keys(), key=lambda x: int(x))]
+    opts = bundle["options"]
+    a = opts["A"]
+    b = opts["B"]
 
-    expenses_total = sum(st.session_state.expenses.values())
+    # Optional free note
+    free_action = st.text_input("İstersen kısa bir not yaz (opsiyonel).", key=f"free_note_{state['month']}_{state['seed']}", placeholder="Örn: 'Kurumsala net bir sınır çizeceğim'")
 
-    prompt = build_month_prompt(
-        month=month,
-        mode=mode,
-        case_seed=case_seed,
-        player_idea=idea,
-        metrics=st.session_state.metrics,
-        expenses=st.session_state.expenses,
-        history_text=history,
-        used_crisis_titles=used_titles,
-    )
+    col1, col2 = st.columns(2, gap="large")
 
-    model = get_model(mode)
-    raw = model.generate_content(prompt).text
-    data = safe_json_loads(raw)
-    if not isinstance(data, dict):
-        st.error("Model JSON döndüremedi. Lütfen tekrar dene.")
-        st.stop()
+    with col1:
+        st.markdown("<div class='choice-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='choice-title'>A) {a['title']}</div>", unsafe_allow_html=True)
 
-    # Normalize fields
-    data.setdefault("situation", {"title": "Durum Analizi", "text": ""})
-    data.setdefault("crisis", {"title": "Kriz", "text": ""})
-    data.setdefault("choices", [])
-
-    if not isinstance(data["choices"], list) or len(data["choices"]) < 2:
-        st.error("Model seçim üretemedi. Lütfen tekrar dene.")
-        st.stop()
-
-    # Keep only first two choices
-    data["choices"] = data["choices"][:2]
-
-    # Ensure choice IDs A/B
-    data["choices"][0]["id"] = "A"
-    data["choices"][1]["id"] = "B"
-
-    # Ensure effects exist
-    for ch in data["choices"]:
-        ch.setdefault("title", "")
-        ch.setdefault("text", "")
-        if not isinstance(ch.get("effects"), dict):
-            ch["effects"] = {}
-
-    # Guardrail: Gemini sometimes produces too-short content even with a big token budget.
-    # We'll do a lightweight second pass to expand Situation/Crisis/Choices text.
-    if needs_expansion(data):
-        try:
-            model2 = get_model(mode)
-            data = expand_payload_with_gemini(model2, prompt, data, mode)
-            # Re-apply IDs/effects constraints
-            data.setdefault("situation", {"title": "Durum Analizi", "text": ""})
-            data.setdefault("crisis", {"title": "Kriz", "text": ""})
-            if isinstance(data.get("choices"), list) and len(data["choices"]) >= 2:
-                data["choices"] = data["choices"][:2]
-                data["choices"][0]["id"] = "A"
-                data["choices"][1]["id"] = "B"
-                for i in range(2):
-                    if not isinstance(data["choices"][i].get("effects"), dict):
-                        data["choices"][i]["effects"] = {}
-        except Exception:
-            pass
-
-    # Normalize effect types/clamps gently
-    diff = MODES.get(mode, MODES["Normal"])["difficulty"]
-    for ch in data["choices"]:
-        eff = ch.get("effects", {})
-        ch["effects"] = {
-            "cash_delta": clamp_int(eff.get("cash_delta", 0), -250_000, 250_000),
-            "mrr_delta": clamp_int(eff.get("mrr_delta", 0), -30_000, 30_000),
-            "reputation_delta": clamp_int(eff.get("reputation_delta", 0), -25, 25),
-            "support_delta": clamp_int(eff.get("support_delta", 0), -25, 25),
-            "infra_delta": clamp_int(eff.get("infra_delta", 0), -25, 25),
-            "churn_delta": clamp_float(eff.get("churn_delta", 0.0), -6.0, 6.0),
-        }
-
-        # Apply difficulty scaling to negative consequences slightly
-        # (Harder modes should punish more; reward slightly less)
-        if diff > 1.0:
-            ch["effects"]["cash_delta"] = int(round(ch["effects"]["cash_delta"] * (1.0 if ch["effects"]["cash_delta"] < 0 else 0.92)))
-            ch["effects"]["mrr_delta"] = int(round(ch["effects"]["mrr_delta"] * (1.0 if ch["effects"]["mrr_delta"] < 0 else 0.92)))
-            ch["effects"]["reputation_delta"] = int(round(ch["effects"]["reputation_delta"] * (1.0 if ch["effects"]["reputation_delta"] < 0 else 0.95)))
-            ch["effects"]["support_delta"] = int(round(ch["effects"]["support_delta"] * (1.0 if ch["effects"]["support_delta"] > 0 else 0.95)))
-            ch["effects"]["infra_delta"] = int(round(ch["effects"]["infra_delta"] * (1.0 if ch["effects"]["infra_delta"] > 0 else 0.95)))
-            ch["effects"]["churn_delta"] = float(ch["effects"]["churn_delta"] * (1.0 if ch["effects"]["churn_delta"] > 0 else 0.95))
-
-    data["unique_key"] = f"{month}-{random.randint(1000,9999)}"
-    data["picked"] = None
-    data["free_move"] = ""
-    data["outcome_summary"] = ""
-    data["expenses_total"] = expenses_total
-
-    st.session_state.months[str(month)] = data
-
-    # Append chat messages once (dedupe-protected)
-    add_chat_message(
-        f"{month}-situation",
-        "assistant",
-        f"🧠 **{data['situation']['title']} (Ay {month})**\n\n{data['situation']['text']}",
-    )
-    add_chat_message(
-        f"{month}-crisis",
-        "assistant",
-        f"⚠️ **{data['crisis']['title']}**\n\n{data['crisis']['text']}",
-    )
-
-
-def apply_choice(month: int, picked: str, free_move: str = ""):
-    data = st.session_state.months[str(month)]
-    if data.get("picked") is not None:
-        return  # already applied
-
-    picked = picked.upper().strip()
-    if picked not in ("A", "B"):
-        return
-
-    data["picked"] = picked
-    data["free_move"] = (free_move or "").strip()
-
-    # Apply effects
-    idx = 0 if picked == "A" else 1
-    effects = data["choices"][idx]["effects"]
-    metrics, summary = apply_effects(st.session_state.metrics, effects, data["expenses_total"])
-    st.session_state.metrics = metrics
-    data["outcome_summary"] = summary
-    st.session_state.months[str(month)] = data
-
-    # Chat: user pick
-    user_line = f"Seçtim: **{picked}** — {data['choices'][idx]['title']}"
-    if data["free_move"]:
-        user_line += f"\n\n_Not:_ {data['free_move']}"
-    add_chat_message(f"{month}-pick", "user", user_line)
-
-    # Chat: outcome
-    add_chat_message(
-        f"{month}-outcome",
-        "assistant",
-        f"✅ **Seçimin işlendi.**\n\n{summary}",
-    )
-
-    # Move to next month
-    st.session_state.current_month = min(st.session_state.current_month + 1, st.session_state.season_months)
-
-
-# =============================
-# Main
-# =============================
-
-def main():
-    init_state()
-    inject_css()
-    render_sidebar()
-    render_header()
-
-    # Idea input / start
-    if not st.session_state.started:
-        st.markdown("---")
-        st.info("Oyuna başlamak için girişim fikrini yaz.")
-        idea = st.text_area("Girişim fikrin ne?", value=st.session_state.idea, height=120)
-        st.session_state.idea = idea
-
-        colA, colB = st.columns([1, 3])
-        with colA:
-            if st.button("🚀 Oyunu Başlat", use_container_width=True):
-                if not st.session_state.idea.strip() and st.session_state.case_name == "Serbest (Rastgele)":
-                    st.warning("Serbest modda başlamak için girişim fikrini yazmalısın.")
-                else:
-                    st.session_state.started = True
-                    # Initial assistant intro
-                    add_chat_message(
-                        "intro-1",
-                        "assistant",
-                        f"Tamam **{st.session_state.player_name}**. Ay 1'den başlıyoruz. Mod: **{st.session_state.mode}**.",
-                    )
-                    add_chat_message(
-                        "intro-2",
-                        "assistant",
-                        "Önce Durum Analizi gelecek, sonra Kriz, sonra A/B seçeceksin.",
-                    )
-                    st.rerun()
-
-        st.stop()
-
-    st.markdown("---")
-
-    # Generate current month if needed
-    month = st.session_state.current_month
-    ensure_month_generated(month)
-
-    # Render chat
-    render_chat()
-
-    # Render choices for the current month (if not yet picked)
-    data = st.session_state.months[str(month)]
-    if data.get("picked") is None:
-        st.markdown("")
-        st.markdown("👉 **Şimdi seçim zamanı. A mı B mi?** (İstersen serbest hamleni de yazabilirsin.)")
-
-        free_move = st.text_input(
-            "İstersen kısa bir not yaz (opsiyonel). Seçim yine A/B ile ilerler.",
-            value="",
-            max_chars=240,
-        )
-
-        choices = data["choices"]
-        st.markdown("<div class='choice-wrap'>", unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        for col, ch in zip([c1, c2], choices):
-            with col:
-                body_html = html.escape(ch.get("text", "")).replace("\n", "<br>")
-                st.markdown(
-                    f"<div class='choice-card'><div class='choice-title'>{html.escape(ch.get('id',''))}) {html.escape(ch.get('title',''))}</div>"
-                    f"<div class='choice-body'>{body_html}</div></div>",
-                    unsafe_allow_html=True,
-                )
-
+        steps = a.get("steps", [])
+        if isinstance(steps, list) and steps:
+            st.markdown("**Plan:**")
+            st.markdown("\n".join([f"- {s}" for s in steps]))
         st.markdown("</div>", unsafe_allow_html=True)
 
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button("A seç", use_container_width=True, key=f"pickA-{month}"):
-                apply_choice(month, "A", free_move=free_move)
-                st.rerun()
-        with b2:
-            if st.button("B seç", use_container_width=True, key=f"pickB-{month}"):
-                apply_choice(month, "B", free_move=free_move)
-                st.rerun()
+        if st.button("A seç", key=f"pickA_{state['month']}", use_container_width=True):
+            resolve_choice(state, "A", free_action=free_action)
+            st.rerun()
 
+    with col2:
+        st.markdown("<div class='choice-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='choice-title'>B) {b['title']}</div>", unsafe_allow_html=True)
+
+        steps = b.get("steps", [])
+        if isinstance(steps, list) and steps:
+            st.markdown("**Plan:**")
+            st.markdown("\n".join([f"- {s}" for s in steps]))
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if st.button("B seç", key=f"pickB_{state['month']}", use_container_width=True):
+            resolve_choice(state, "B", free_action=free_action)
+            st.rerun()
+
+def render_playing(state: dict) -> None:
+    ensure_bundle(state)
+    post_bundle_to_chat(state)
+
+    render_chat(state)
+
+    # Choice UI (kartlar)
+    st.markdown("---")
+    render_choice_ui(state)
+
+def render_finished(state: dict) -> None:
+    render_chat(state)
+    st.success("Sezon tamamlandı. Yeni bir vaka için sol alttan 'Oyunu sıfırla' diyebilirsin.")
+
+
+# =========================
+# Main
+# =========================
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    inject_css()
+
+    if "game_state" not in st.session_state:
+        st.session_state["game_state"] = init_state()
+
+    state = st.session_state["game_state"]
+
+    sidebar(state)
+    top_bar(state)
+
+    # User: API anahtarlarını ekranda paylaştıysa güvenlik uyarısı (metinde anahtarı tekrar etmeyelim)
+    st.caption("Not: Eğer API anahtarını yanlışlıkla paylaştıysan, güvenlik için hemen yenilemen iyi olur.")
+
+    if state["phase"] == "setup":
+        render_setup(state)
+    elif state["phase"] == "playing":
+        render_playing(state)
     else:
-        st.caption("Bu ayın seçimi işlendi. Devam etmek için sonraki ay üretilecek.")
+        render_finished(state)
 
 
 if __name__ == "__main__":
