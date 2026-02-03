@@ -23,7 +23,7 @@ import streamlit as st
 
 APP_TITLE = "Startup Survivor RPG"
 APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. True Story vakalar + modlar."
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -106,6 +106,50 @@ def strip_code_fences(s: str) -> str:
         return m.group(1).strip()
     return s
 
+
+def escape_newlines_in_json_strings(s: str) -> str:
+    """Escape bare newlines inside quoted strings.
+
+    LLM outputs sometimes include literal newlines inside string values, which breaks JSON and even Python-literal parsing.
+    We escape \n/\r only when we're *inside* a quoted string (either "..." or '...').
+    """
+    if not s:
+        return s
+    out: List[str] = []
+    in_str = False
+    quote = ""
+    esc = False
+    for ch in s:
+        if in_str:
+            if esc:
+                out.append(ch)
+                esc = False
+                continue
+            if ch == "\\":  # start escape
+                out.append(ch)
+                esc = True
+                continue
+            if ch == quote:
+                out.append(ch)
+                in_str = False
+                quote = ""
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            out.append(ch)
+        else:
+            if ch in ('"', "'"):
+                out.append(ch)
+                in_str = True
+                quote = ch
+            else:
+                out.append(ch)
+    return "".join(out)
+
 def try_parse_json(raw: str) -> Optional[dict]:
     """Best-effort JSON parser for LLM outputs.
 
@@ -138,6 +182,10 @@ def try_parse_json(raw: str) -> Optional[dict]:
 
     # Fix trailing commas
     s = re.sub(r",\s*([}\]])", r"\1", s)
+
+
+    # Escape bare newlines inside quoted strings (LLM outputs can violate JSON)
+    s = escape_newlines_in_json_strings(s)
 
     # First attempt: strict JSON
     try:
@@ -821,6 +869,7 @@ def init_state() -> None:
 
     ss.setdefault("history", [])          # list of past month choices
     ss.setdefault("months", {})           # month -> content bundle
+    ss.setdefault("month_sources", {})    # month -> "gemini" | "offline"
     ss.setdefault("chat", [])             # chat messages
     ss.setdefault("delayed_queue", [])    # list of delayed effects dicts
 
@@ -945,7 +994,12 @@ Geçmiş seçim özeti:
 
 {context_metrics}
 
-Şimdi sadece aşağıdaki JSON'u üret (çıktı SADECE JSON olsun):
+Şimdi sadece aşağıdaki JSON'u üret (çıktı SADECE JSON olsun).
+ÖNEMLİ JSON KURALLARI:
+- SADECE JSON döndür: markdown/code fence yok, başlık yok, açıklama yok.
+- Tüm anahtarlar ve string değerler çift tırnak (") kullanmalı.
+- "durum_analizi" ve "kriz" alanlarında paragraf ayrımı gerekiyorsa gerçek satır sonu kullanma; bunun yerine "\n\n" dizisini kullan.
+
 
 Şema:
 {{
@@ -1000,6 +1054,7 @@ KURALLAR:
 - SADECE JSON döndür. Başka hiçbir açıklama, markdown, kod bloğu, ön/son metin YOK.
 - Çıktın mutlaka tek bir JSON nesnesi olsun ({{...}}).
 - Türkçe karakterler serbest.
+- Çok satırlı alanlarda satır sonlarını \\n olarak kaçır; string içinde çıplak newline karakteri OLMASIN.
 - Şema alanları eksikse, mantıklı şekilde tamamla ama uydurma uzun hikâye ekleme.
 
 BEKLENEN ŞEMA:
@@ -1015,6 +1070,19 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
     case = get_case(get_locked("case_key", ss["case_key"]))
     stats = ss["stats"]
     history = ss["history"]
+
+
+    with st.sidebar.expander("🛠️ LLM Debug", expanded=False):
+        if ss.get("llm_last_error"):
+            st.write(f"**Son hata:** {ss.get('llm_last_error')}")
+        raw = ss.get("llm_last_raw", "")
+        rep = ss.get("llm_last_raw_repaired", "")
+        if raw:
+            st.caption("Son ham yanıt (kısaltılmış):")
+            st.code(raw[:1500])
+        if rep:
+            st.caption("Onarım sonrası yanıt (kısaltılmış):")
+            st.code(rep[:1500])
 
     if ss.get("llm_disabled"):
         return offline_month_bundle(case.seed, mode, month, idea, history, case), "offline"
@@ -1331,6 +1399,7 @@ def ensure_month_ready(llm: GeminiLLM, month: int) -> None:
         return
     bundle, source = generate_month_bundle(llm, month)
     ss["months"][month] = bundle
+    ss["month_sources"][month] = source
 
     ss["chat"].append({"role": "assistant", "kind": "analysis", "content": f"**🧩 Durum Analizi (Ay {month})**\n\n{bundle['durum_analizi']}"})
     ss["chat"].append({"role": "assistant", "kind": "crisis", "content": f"**⚠️ Kriz (Ay {month})**\n\n{bundle['kriz']}"})
@@ -1338,7 +1407,7 @@ def ensure_month_ready(llm: GeminiLLM, month: int) -> None:
         ss["chat"].append({"role": "assistant", "kind": "note", "content": f"🗂️ {bundle['note']}"})
 
     if source == "offline" and ss.get("llm_last_error"):
-        ss["chat"].append({"role": "assistant", "kind": "warn", "content": f"⚠️ **Gemini kapalı (offline)**: {ss['llm_last_error']}\n\nİstersen `google-genai` kurup tekrar dene."})
+        ss["chat"].append({"role": "assistant", "kind": "warn", "content": f"⚠️ **Gemini bu ay JSON formatında yanıt veremedi**: {ss['llm_last_error']}\n\nBu ay için offline içerik gösteriyorum. Sağ menüden **'Bu ayı Gemini ile yeniden üret'** ile tekrar deneyebilirsin."})
 
 
 # =========================
@@ -1430,7 +1499,20 @@ def render_sidebar(llm: GeminiLLM) -> None:
         msg = ss.get("llm_last_error") or status.note or "Gemini kapalı."
         st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
 
-    
+    # Eğer bu ay offline üretildiyse (JSON format problemi), kullanıcı tek tıkla yeniden denesin.
+    cur_m = int(ss.get("month", 1))
+    if ss.get("started") and not ss.get("ended") and ss.get("month_sources", {}).get(cur_m) == "offline" and status.ok and not ss.get("llm_disabled"):
+        if st.sidebar.button("🔁 Bu ayı Gemini ile yeniden üret", use_container_width=True):
+            try:
+                if cur_m in ss.get("months", {}):
+                    del ss["months"][cur_m]
+                ss.get("month_sources", {}).pop(cur_m, None)
+            except Exception:
+                pass
+            ss["llm_last_error"] = ""
+            st.rerun()
+
+
     if ss.get("llm_disabled"):
         if st.sidebar.button("Gemini\'yi yeniden dene", use_container_width=True):
             ss["llm_disabled"] = False
