@@ -495,7 +495,7 @@ class GeminiLLM:
             from google import genai  # type: ignore
             self._client = genai.Client(api_key=self.api_keys[0])
             self.backend = "genai"
-            self.model_in_use = "gemini-1.5-pro"
+            self.model_in_use = "gemini-2.5-pro"
             return
         except Exception as e:
             self._client = None
@@ -507,7 +507,7 @@ class GeminiLLM:
             genai_legacy.configure(api_key=self.api_keys[0])
             self._legacy = genai_legacy
             self.backend = "legacy"
-            self.model_in_use = "gemini-1.5-pro"
+            self.model_in_use = "gemini-2.5-pro"
             return
         except Exception as e:
             self._legacy = None
@@ -533,8 +533,9 @@ class GeminiLLM:
         - Rotates across all provided API keys if an error occurs.
         """
         candidates = [
-            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
             "gemini-2.5-flash",
+            "gemini-3-flash-preview",
             "gemini-2.0-flash",
             "gemini-1.5-flash",
             "gemini-1.5-pro",
