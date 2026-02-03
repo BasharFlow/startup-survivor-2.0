@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import ast
 import os
 import random
 import re
@@ -106,19 +107,52 @@ def strip_code_fences(s: str) -> str:
     return s
 
 def try_parse_json(raw: str) -> Optional[dict]:
+    """Best-effort JSON parser for LLM outputs.
+
+    Tries:
+    - strip code fences
+    - extract the first {...} block
+    - normalize smart quotes
+    - remove trailing commas
+    - json.loads
+    - ast.literal_eval fallback (handles single quotes) after normalizing true/false/null
+    """
     if not raw:
         return None
+
     s = strip_code_fences(raw)
+
     # Best effort: grab first {...} block
-    if not (s.strip().startswith("{") and s.strip().endswith("}")):
+    ss = s.strip()
+    if not (ss.startswith("{") and ss.endswith("}")):
         i = s.find("{")
         j = s.rfind("}")
         if i != -1 and j != -1 and j > i:
             s = s[i : j + 1]
+
+    # Normalize common “smart quotes” coming from some models
+    s = (s or "").replace("“", """).replace("”", """).replace("’", "'").replace("‘", "'")
+
+    # Remove non-printable control chars (except whitespace)
+    s = "".join(ch for ch in s if (ch >= " " or ch in "\n\r\t"))
+
     # Fix trailing commas
     s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # First attempt: strict JSON
     try:
-        return json.loads(s)
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    # Second attempt: Python literal (single quotes etc.)
+    try:
+        py = re.sub(r"\bnull\b", "None", s, flags=re.IGNORECASE)
+        py = re.sub(r"\btrue\b", "True", py, flags=re.IGNORECASE)
+        py = re.sub(r"\bfalse\b", "False", py, flags=re.IGNORECASE)
+        obj = ast.literal_eval(py)
+        return obj if isinstance(obj, dict) else None
     except Exception:
         return None
 
@@ -548,14 +582,28 @@ class GeminiLLM:
             if self.backend == "genai" and self._client is not None:
                 for m in candidates:
                     try:
-                        res = self._client.models.generate_content(
-                            model=m,
-                            contents=prompt,
-                            config={
-                                "temperature": float(temperature),
-                                "max_output_tokens": int(max_output_tokens),
-                            },
-                        )
+                        res = None
+                        try:
+                            # Prefer JSON-safe responses when supported by the installed SDK.
+                            res = self._client.models.generate_content(
+                                model=m,
+                                contents=prompt,
+                                config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                    "response_mime_type": "application/json",
+                                },
+                            )
+                        except TypeError:
+                            # Older SDK versions may not support response_mime_type.
+                            res = self._client.models.generate_content(
+                                model=m,
+                                contents=prompt,
+                                config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                },
+                            )
                         txt = getattr(res, "text", "") or ""
                         if txt.strip():
                             self.model_in_use = m
@@ -568,13 +616,24 @@ class GeminiLLM:
                 for m in candidates:
                     try:
                         model = self._legacy.GenerativeModel(m)
-                        res = model.generate_content(
-                            prompt,
-                            generation_config={
-                                "temperature": float(temperature),
-                                "max_output_tokens": int(max_output_tokens),
-                            },
-                        )
+                        res = None
+                        try:
+                            res = model.generate_content(
+                                prompt,
+                                generation_config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                    "response_mime_type": "application/json",
+                                },
+                            )
+                        except Exception:
+                            res = model.generate_content(
+                                prompt,
+                                generation_config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                },
+                            )
                         txt = getattr(res, "text", "") or ""
                         if txt.strip():
                             self.model_in_use = m
@@ -770,7 +829,10 @@ def init_state() -> None:
     ss.setdefault("locked_settings", {})  # frozen snapshot when started
 
     ss.setdefault("llm_disabled", False)
+    ss.setdefault("llm_fail_count", 0)
     ss.setdefault("llm_last_error", "")
+    ss.setdefault("llm_last_raw", "")
+    ss.setdefault("llm_last_raw_repaired", "")
 
 def reset_game(keep_settings: bool = True) -> None:
     ss = st.session_state
@@ -912,6 +974,40 @@ Kurallar:
 - Metrik isimlerini metne koyma.
 """.strip()
 
+def build_json_repair_prompt(bad_output: str) -> str:
+    """Ask the model to return ONLY valid JSON matching our expected schema."""
+    bad_output = (bad_output or "").strip()
+    schema = r'''
+{
+  "durum_analizi": "string (>= 220 karakter)",
+  "kriz": "string (>= 220 karakter)",
+  "A": {
+    "title": "string",
+    "tag": "growth|efficiency|reliability|compliance|fundraising|people|product|sales|marketing|security",
+    "steps": ["en az 4 madde"],
+    "risk": "low|med|high",
+    "delayed_seed": "kısa tohum (<= 6 kelime)"
+  },
+  "B": { "title": "...", "tag": "...", "steps": ["..."], "risk": "...", "delayed_seed": "..." },
+  "note": "opsiyonel"
+}
+'''.strip()
+
+    return f"""Aşağıdaki metin, beklenen şemaya göre JSON olmalıydı ama geçerli JSON değil.
+Görevin: Metni AYNEN aynı anlamı koruyarak geçerli JSON'a dönüştürmek.
+
+KURALLAR:
+- SADECE JSON döndür. Başka hiçbir açıklama, markdown, kod bloğu, ön/son metin YOK.
+- Çıktın mutlaka tek bir JSON nesnesi olsun ({{...}}).
+- Türkçe karakterler serbest.
+- Şema alanları eksikse, mantıklı şekilde tamamla ama uydurma uzun hikâye ekleme.
+
+BEKLENEN ŞEMA:
+{schema}
+
+DÖNÜŞTÜRÜLECEK METİN:
+{bad_output}
+"""
 def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
     ss = st.session_state
     mode = get_locked("mode", ss["mode"])
@@ -928,7 +1024,16 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
 
     try:
         raw = llm.generate_text(prompt, temperature=temperature, max_output_tokens=1700)
+        ss["llm_last_raw"] = (raw or "")[:8000]
+
         data = try_parse_json(raw)
+
+        # If the model didn't return valid JSON, attempt a "JSON repair" pass once.
+        if not data:
+            repaired = llm.generate_text(build_json_repair_prompt(raw), temperature=0.1, max_output_tokens=2000)
+            ss["llm_last_raw_repaired"] = (repaired or "")[:8000]
+            data = try_parse_json(repaired)
+
         if not data:
             raise ValueError("JSON parse edilemedi.")
 
@@ -952,7 +1057,7 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
             "note": str(data.get("note", "") or "").strip()[:240],
         }
 
-        # Minimal quality checks
+        # Minimal quality checks (we can pad with offline snippets rather than hard-failing)
         if len(bundle["A"]["steps"]) < 4 or len(bundle["B"]["steps"]) < 4:
             raise ValueError("Seçenek adımları çok kısa geldi.")
         if len(bundle["durum_analizi"]) < 220 or len(bundle["kriz"]) < 220:
@@ -962,13 +1067,20 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
             if len(bundle["kriz"]) < 220:
                 bundle["kriz"] = off["kriz"] + "\n\n---\n\n" + bundle["kriz"]
 
+        # Success -> reset fail counter and error
+        ss["llm_fail_count"] = 0
+        ss["llm_last_error"] = ""
+
         return bundle, "gemini"
     except Exception as e:
         ss["llm_last_error"] = f"{type(e).__name__}: {e}"
-        ss["llm_disabled"] = True
+        ss["llm_fail_count"] = int(ss.get("llm_fail_count", 0)) + 1
+
+        # Disable only after repeated failures (keeps Gemini usable if it's a one-off formatting glitch)
+        if ss["llm_fail_count"] >= 3:
+            ss["llm_disabled"] = True
+
         return offline_month_bundle(case.seed, mode, month, idea, history, case), "offline"
-
-
 # =========================
 # Game mechanics
 # =========================
@@ -1318,7 +1430,15 @@ def render_sidebar(llm: GeminiLLM) -> None:
         msg = ss.get("llm_last_error") or status.note or "Gemini kapalı."
         st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
 
-    if st.sidebar.button("Oyunu sıfırla", use_container_width=True):
+    
+if ss.get("llm_disabled"):
+    if st.sidebar.button("Gemini'yi yeniden dene", use_container_width=True):
+        ss["llm_disabled"] = False
+        ss["llm_fail_count"] = 0
+        ss["llm_last_error"] = ""
+        st.rerun()
+
+if st.sidebar.button("Oyunu sıfırla", use_container_width=True):
         reset_game(keep_settings=False)
         st.rerun()
 
