@@ -1,5 +1,6 @@
-# app.py
+# app_v3.py
 # Startup Survivor RPG — Streamlit single-file app
+# v3: Mode/Case overhaul + bug fixes + locked settings + character archetypes + delayed effects
 
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape as html_escape
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -20,8 +21,8 @@ import streamlit as st
 # =========================
 
 APP_TITLE = "Startup Survivor RPG"
-APP_SUBTITLE = "Sohbet akışı korunur. Ay 1'den başlar. Durum Analizi → Kriz → A/B seçimi."
-APP_VERSION = "2.1.0"
+APP_SUBTITLE = "Ay bazlı startup simülasyonu: Durum Analizi → Kriz → A/B kararı. True Story vakalar + modlar."
+APP_VERSION = "3.0.0"
 
 st.set_page_config(
     page_title=APP_TITLE,
@@ -42,26 +43,30 @@ section[data-testid="stSidebar"] .block-container {padding-top: 1.0rem;}
 }
 .card h3 {margin: 0 0 .4rem 0;}
 .muted {opacity: .75;}
+.smallcaps {font-variant: all-small-caps; letter-spacing: .04em;}
 hr.soft {border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 1rem 0;}
 .choice {
   border: 1px solid rgba(255,255,255,0.10);
   border-radius: 18px;
   padding: 18px 18px 14px 18px;
   background: rgba(255,255,255,0.02);
-  min-height: 260px;
 }
-.choice .title {font-size: 1.45rem; font-weight: 800; margin-bottom: .45rem;}
-.choice ul {margin-top: .25rem; margin-bottom: .75rem;}
-.choice li {margin-bottom: .25rem;}
-div.stButton > button {
-  border-radius: 14px;
-  padding: .55rem 1.1rem;
-  font-weight: 700;
+.choice h4 {margin: 0 0 .3rem 0;}
+.pill {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.12);
+  font-size: 12px;
+  opacity: .85;
 }
-.smallcaps {font-variant: small-caps; letter-spacing: .02em;}
-[data-testid="stChatMessage"] {border-radius: 18px;}
+.pill.warn {border-color: rgba(255,190,90,0.35);}
+.pill.ok {border-color: rgba(120,255,160,0.25);}
+.pill.bad {border-color: rgba(255,120,120,0.25);}
+kbd {padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.04);}
 </style>
 """
+
 st.markdown(CSS, unsafe_allow_html=True)
 
 
@@ -69,25 +74,21 @@ st.markdown(CSS, unsafe_allow_html=True)
 # Helpers
 # =========================
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-def money(v: float) -> str:
-    try:
-        s = f"{int(round(v)):,}".replace(",", ".")
-        return f"{s} ₺"
-    except Exception:
-        return f"{v} ₺"
-
-def pct(v: float) -> str:
-    return f"%{v*100:.1f}"
-
 def now_id() -> str:
-    return datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
-def md_escape_li(items: List[str]) -> str:
-    lis = "".join(f"<li>{html_escape(str(s))}</li>" for s in items)
-    return f"<ul class='choice-steps'>{lis}</ul>"
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def money(x: float) -> str:
+    # TRY format
+    try:
+        return f"{x:,.0f} ₺".replace(",", ".")
+    except Exception:
+        return f"{x} ₺"
+
+def pct(x: float) -> str:
+    return f"%{x * 100:.1f}"
 
 def ensure_list(x: Any) -> List[Any]:
     if x is None:
@@ -96,74 +97,345 @@ def ensure_list(x: Any) -> List[Any]:
         return x
     return [x]
 
-def try_parse_json(s: str) -> dict | None:
-    if not s:
+def strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    # ```json ... ```
+    m = re.search(r"```(?:json)?\s*(.*?)```", s, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return s
+
+def try_parse_json(raw: str) -> Optional[dict]:
+    if not raw:
         return None
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL | re.IGNORECASE)
-    if fence:
-        s2 = fence.group(1).strip()
-        try:
-            return json.loads(s2)
-        except Exception:
-            pass
-    start = s.find("{")
-    end = s.rfind("}")
-    if start >= 0 and end > start:
-        blob = s[start:end+1]
-        try:
-            return json.loads(blob)
-        except Exception:
-            blob2 = re.sub(r",(\s*[}\]])", r"\1", blob)
-            try:
-                return json.loads(blob2)
-            except Exception:
-                return None
-    return None
+    s = strip_code_fences(raw)
+    # Best effort: grab first {...} block
+    if not (s.strip().startswith("{") and s.strip().endswith("}")):
+        i = s.find("{")
+        j = s.rfind("}")
+        if i != -1 and j != -1 and j > i:
+            s = s[i : j + 1]
+    # Fix trailing commas
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def normalize_steps(x: Any) -> List[str]:
+    out = [str(s).strip() for s in ensure_list(x) if s is not None]
+    out = [s for s in out if s][:6]
+    return out
+
+def normalize_tag(x: Any) -> str:
+    allowed = {
+        "growth","efficiency","reliability","compliance","fundraising","people",
+        "product","sales","marketing","security"
+    }
+    t = str(x or "").strip().lower()
+    if t in allowed:
+        return t
+    # coarse mapping
+    if "growth" in t or "büy" in t:
+        return "growth"
+    if "eff" in t or "maliyet" in t or "kıs" in t:
+        return "efficiency"
+    if "reli" in t or "stabil" in t or "altyap" in t or "support" in t:
+        return "reliability"
+    if "comp" in t or "uyum" in t or "reg" in t:
+        return "compliance"
+    if "fund" in t or "yat" in t:
+        return "fundraising"
+    if "people" in t or "ekip" in t or "hr" in t:
+        return "people"
+    if "sec" in t or "güven" in t:
+        return "security"
+    if "sale" in t or "sat" in t:
+        return "sales"
+    if "market" in t or "pazar" in t:
+        return "marketing"
+    if "product" in t or "ürün" in t:
+        return "product"
+    return "growth"
+
+def normalize_risk(x: Any) -> str:
+    t = str(x or "").strip().lower()
+    if t in {"low","med","high"}:
+        return t
+    if "düş" in t:
+        return "low"
+    if "yük" in t:
+        return "high"
+    return "med"
+
+def tag_label(tag: str) -> str:
+    return {
+        "growth":"Büyüme",
+        "efficiency":"Verimlilik",
+        "reliability":"Dayanıklılık",
+        "compliance":"Uyum/Hukuk",
+        "fundraising":"Yatırım/Finansman",
+        "people":"Ekip/İK",
+        "product":"Ürün",
+        "sales":"Satış",
+        "marketing":"Pazarlama",
+        "security":"Güvenlik",
+    }.get(tag, tag)
+
+def risk_label(r: str) -> str:
+    return {"low":"Düşük risk", "med":"Orta risk", "high":"Yüksek risk"}.get(r, r)
 
 
 # =========================
-# Real-world inspired cases (safe, simplified)
+# True Story cases
 # =========================
 
 @dataclass
 class CaseSeason:
     key: str
     title: str
+    years: str
     blurb: str
     seed: int
     inspired_by: str
+    sources: List[Tuple[str, str]]
+    real_outcome: List[str]
+
+def _src(title: str, url: str) -> Tuple[str, str]:
+    return (title, url)
 
 CASE_LIBRARY: List[CaseSeason] = [
-    CaseSeason("free", "Serbest (Rastgele)", "Kendi fikrine göre rastgele olaylar. Her ay farklı kriz.", 1, ""),
-    CaseSeason("airbnb_2008", "Vaka: Talep Çöküşü (2008)", "Bütçeler kısılır, talep düşer; hayatta kalma ve yeniden konumlama.", 2008, "Airbnb'nin 2008 dönemi (genel esin)"),
-    CaseSeason("wework_2019", "Vaka: Aşırı Büyüme & Güven Krizi (2019)", "Hız, PR, yatırımcı güveni ve 'ne satıyoruz?' sorusu aynı anda patlar.", 2019, "WeWork 2019 tartışmaları (genel esin)"),
-    CaseSeason("theranos_style", "Vaka: Vaat-Gerçeklik Uçurumu", "Ürün gerçeği yetişmiyor; beklenti yönetimi, doğruluk, güven.", 31415, "Sağlık/medtech skandalları (genel esin)"),
-    CaseSeason("ftx_2022_style", "Vaka: Güven, Şeffaflık, Likidite (2022)", "Güven bir gecede buharlaşır; iletişim ve risk yönetimi sınavı.", 2022, "Büyük çöküşler ve güven krizleri (genel esin)"),
+    CaseSeason(
+        key="free",
+        title="Serbest (Rastgele)",
+        years="—",
+        blurb="Kendi fikrine göre rastgele olaylar. Her ay farklı kriz.",
+        seed=1,
+        inspired_by="",
+        sources=[],
+        real_outcome=[],
+    ),
+
+    # 10 True Story cases
+    CaseSeason(
+        key="facebook_privacy_2019",
+        title="True Story: Mahremiyet & Regülasyon Kıskacı",
+        years="2018–2019",
+        blurb="Mahremiyet krizi büyür; regülatör baskısı ve toplu davalar iş modelini sıkıştırır.",
+        seed=2019,
+        inspired_by="Facebook/FTC gizlilik uzlaşması dinamiği",
+        sources=[
+            _src("FTC press release (2019) — Facebook privacy restrictions", "https://www.ftc.gov/news-events/news/press-releases/2019/07/ftc-imposes-5-billion-penalty-sweeping-new-privacy-restrictions-facebook"),
+        ],
+        real_outcome=[
+            "ABD FTC, 2019'da Facebook'a 5 milyar $ ceza ve kapsamlı gizlilik yükümlülükleri getirdi.",
+            "Şirketin gizlilik programı ve yönetim düzeyinde sorumluluk mekanizmaları güçlendirildi.",
+        ],
+    ),
+    CaseSeason(
+        key="wework_ipo_2019",
+        title="True Story: IPO Çöküşü & Güven Krizi",
+        years="2019",
+        blurb="Hiper büyüme, nakit yakımı ve yönetişim sorunları halka arzı çökertir.",
+        seed=2019_2,
+        inspired_by="WeWork 2019 IPO süreci dinamiği",
+        sources=[
+            _src("Business Wire (2019) — WeWork withdraws S‑1", "https://www.businesswire.com/news/home/20190930005559/en/WeWork-Withdraw-S-1-Registration-Statement"),
+        ],
+        real_outcome=[
+            "WeWork 30 Eylül 2019'da S‑1 kayıt beyanını geri çektiğini duyurdu.",
+            "Ardından yeniden yapılanma ve finansman arayışı gündeme geldi.",
+        ],
+    ),
+    CaseSeason(
+        key="blackberry_platform_shift",
+        title="True Story: Ekosistem Kayması — Kalite Yetmiyor",
+        years="2007–2016",
+        blurb="Ürün kaliteli olsa da ekosistem/pazar standardı değişir; platform kayması boğar.",
+        seed=2007,
+        inspired_by="BlackBerry'nin platform kayması ve dönüşümü dinamiği",
+        sources=[
+            _src("Platform Digit — Rise/Fall of BlackBerry", "https://d3.harvard.edu/platform-digit/submission/the-rise-and-fall-and-rise-again-of-blackberry/"),
+            _src("WIRED (2016) — BlackBerry handsets shift (context)", "https://www.wired.com/story/blackberry-stop-making-handsets/"),
+        ],
+        real_outcome=[
+            "Akıllı telefon pazarı uygulama ekosistemi ve UX standardı etrafında hızla değişti.",
+            "BlackBerry 2016'da donanım odağını bırakıp yazılım/servislere daha fazla yöneldi.",
+        ],
+    ),
+    CaseSeason(
+        key="samsung_note7_recall",
+        title="True Story: Ürün Güvenliği & Küresel Geri Çağırma",
+        years="2016",
+        blurb="Safety krizi geri çağırma dalgasına dönüşür; nakit, itibar ve operasyon aynı anda yanar.",
+        seed=2016,
+        inspired_by="Galaxy Note7 geri çağırma dinamiği",
+        sources=[
+            _src("US CPSC recall notice (2016)", "https://www.cpsc.gov/Recalls/2016/Samsung-Recalls-Galaxy-Note7-Smartphones"),
+        ],
+        real_outcome=[
+            "2016'da ürün güvenliği riski nedeniyle geniş kapsamlı geri çağırma ve üretim durdurma adımları atıldı.",
+            "Maliyet, itibar ve tedarik zinciri baskısı aynı anda yönetilmek zorunda kaldı.",
+        ],
+    ),
+    CaseSeason(
+        key="uber_2017_crisis",
+        title="True Story: Kültür Skandalı & Yönetim Krizi",
+        years="2017",
+        blurb="Davalar, kamuoyu ve kültür sorunları birleşir; yönetim krizi büyümeyi tehdit eder.",
+        seed=2017,
+        inspired_by="Uber 2017 kriz zinciri dinamiği",
+        sources=[
+            _src("TIME (2017) — Kalanick resigns", "https://time.com/4826194/uber-travis-kalanick-resigns/"),
+        ],
+        real_outcome=[
+            "2017'de şirket içi kültür ve kamuoyu baskısı liderlik krizine dönüştü.",
+            "Üst yönetim değişiklikleri ve itibar onarımı gündeme geldi.",
+        ],
+    ),
+    CaseSeason(
+        key="equifax_breach_settlement",
+        title="True Story: Dev Veri İhlali & Tazminat Baskısı",
+        years="2017–2019",
+        blurb="Data breach sonrası güven çöküşü; regülatör ve tazminat maliyeti şirketi sıkıştırır.",
+        seed=2017_2,
+        inspired_by="Equifax 2017 ihlali sonrası settlement dinamiği",
+        sources=[
+            _src("FTC (2019) — Equifax settlement", "https://www.ftc.gov/news-events/news/press-releases/2019/07/equifax-pay-575-million-part-settlement-ftc-cfpb-states-related-2017-data-breach"),
+        ],
+        real_outcome=[
+            "Equifax 2017 ihlali sonrası FTC/CFPB/eyaletlerle 2019'da kapsamlı settlement duyuruldu.",
+            "Güven onarımı, güvenlik programı ve mali tazminat baskısı birlikte yönetildi.",
+        ],
+    ),
+    CaseSeason(
+        key="vw_dieselgate",
+        title="True Story: Regülasyon İhlali & Büyük Yaptırım",
+        years="2015–2017",
+        blurb="Uyum ihlali büyük cezaya dönüşür; hukuk, itibar, operasyon aynı anda krize girer.",
+        seed=2015,
+        inspired_by="Volkswagen Dieselgate dinamiği",
+        sources=[
+            _src("US DOJ (2017) — Volkswagen plea and penalties", "https://www.justice.gov/archives/opa/pr/volkswagen-ag-agrees-plead-guilty-and-pay-43-billion-criminal-and-civil-penalties-six"),
+        ],
+        real_outcome=[
+            "Skandal sonrası milyarlarca $ ceza/uzlaşma ve kapsamlı uyum yükümlülükleri gündeme geldi.",
+            "Şirketin uyum ve itibar onarımı uzun soluklu bir dönüşüm sürecine dönüştü.",
+        ],
+    ),
+    CaseSeason(
+        key="boeing_737max_grounding",
+        title="True Story: Güvenlik Krizi & Ürün Durdurma",
+        years="2019",
+        blurb="Ürün güvenliği ve kamu baskısı operasyonu durdurmaya kadar gider; sert regülasyon devreye girer.",
+        seed=2019_3,
+        inspired_by="Boeing 737 MAX grounding dinamiği",
+        sources=[
+            _src("US DOT (2019) — Temporary grounding statement", "https://www.transportation.gov/briefing-room/statement-temporary-grounding-boeing-737-max-aircraft-operated-us-airlines-or-us"),
+        ],
+        real_outcome=[
+            "2019'da 737 MAX uçuşları birçok otorite tarafından geçici olarak durduruldu (grounding).",
+            "Güvenlik, sertifikasyon ve itibar boyutu aynı anda ele alındı.",
+        ],
+    ),
+    CaseSeason(
+        key="wells_fargo_accounts",
+        title="True Story: Satış Baskısı & Sahte Hesap Skandalı",
+        years="2016",
+        blurb="Hedef baskısı yanlış teşvikler doğurur; uyum ve itibar krizi patlar.",
+        seed=2016_2,
+        inspired_by="Wells Fargo unauthorized accounts dinamiği",
+        sources=[
+            _src("CFPB enforcement (2016) — Wells Fargo", "https://www.consumerfinance.gov/enforcement/actions/wells-fargo-bank-2016/"),
+        ],
+        real_outcome=[
+            "2016'da izinsiz hesap açma iddiaları sonrası düzenleyici yaptırımlar gündeme geldi.",
+            "Teşvik sistemi, kültür ve uyum programları yeniden ele alındı.",
+        ],
+    ),
+    CaseSeason(
+        key="deepwater_horizon",
+        title="True Story: Felaket Operasyon & Dev Tazminat",
+        years="2010–2015",
+        blurb="Operasyon felaketi, uzun soluklu hukuk ve tazminat yüküne dönüşür; şirket sarsılır.",
+        seed=2010,
+        inspired_by="Deepwater Horizon sonrası settlement dinamiği",
+        sources=[
+            _src("US DOJ (2015) — BP historic settlement", "https://www.justice.gov/archives/opa/pr/us-and-five-gulf-states-reach-historic-settlement-bp-resolve-civil-lawsuit-over-deepwater"),
+        ],
+        real_outcome=[
+            "2015'te ABD ve Gulf eyaletleriyle büyük bir uzlaşma açıklandı; tazminat ve ceza yükü büyüktü.",
+            "Operasyon güvenliği ve risk yönetimi şirket stratejisinin merkezine oturdu.",
+        ],
+    ),
 ]
+
+def get_case(case_key: str) -> CaseSeason:
+    for c in CASE_LIBRARY:
+        if c.key == case_key:
+            return c
+    return CASE_LIBRARY[0]
 
 
 # =========================
 # Modes / Difficulty
 # =========================
 
-MODES = {
-    "Normal": {
-        "desc": "Dengeli. İyi kararlar ödüllenir, kötü kararlar acıtır.",
-        "temp": 0.8,
-        "swing": 1.0,
-        "tone": "gerçekçi, net, dramatik ama abartısız",
+MODES: Dict[str, Dict[str, Any]] = {
+    "Gerçekçi": {
+        "desc": "Tam gerçek dünya hissi. Trade-off net, mucize yok.",
+        "temp": 0.75,
+        "swing": 1.00,
+        "tone": "tamamen gerçekçi, operatif, net; abartı yok; ölçülü dramatik",
+        "require_reason": False,
+        "deceptive": False,
+        "antagonistic": False,
+        "turkey": False,
+        "absurd": False,
+    },
+    "Zor": {
+        "desc": "Gerçekçi ama daha zor. Seçenekler yanıltıcı olabilir; kısa gerekçe yazmanı ister.",
+        "temp": 0.82,
+        "swing": 1.25,
+        "tone": "sert ama adil; belirsizlik yüksek; hızlı karar baskısı",
+        "require_reason": True,
+        "deceptive": True,
+        "antagonistic": False,
+        "turkey": False,
+        "absurd": False,
+    },
+    "Spartan": {
+        "desc": "En zor. Anlatıcı antagonistik; dünya acımasız ama mantıklı.",
+        "temp": 0.88,
+        "swing": 1.45,
+        "tone": "acımasız derecede gerçekçi; iğneleyici ama saygılı; baskı çok yüksek",
+        "require_reason": True,
+        "deceptive": True,
+        "antagonistic": True,
+        "turkey": False,
+        "absurd": False,
+    },
+    "Türkiye": {
+        "desc": "Türkiye şartları: kur/enflasyon, vergi/SGK, denetimler, tahsilat gecikmesi, afet riski.",
+        "temp": 0.78,
+        "swing": 1.10,
+        "tone": "Türkiye iş dünyası gerçekleri; maliyet ve uyum detaylı; somut ve gerçekçi",
+        "require_reason": False,
+        "deceptive": False,
+        "antagonistic": False,
+        "turkey": True,
+        "absurd": False,
     },
     "Extreme": {
-        "desc": "Kaos ve absürt. Paylaşmalık olaylar. Sonuç metriklere çarpar.",
-        "temp": 1.0,
-        "swing": 1.45,
-        "tone": "çok yüksek gerilim, keskin mizah, şok edici ama anlaşılır",
-    },
-    "Hard": {
-        "desc": "Zor. Hata affetmez. Kısa vadeli çözümler uzun vadede geri teper.",
-        "temp": 0.9,
-        "swing": 1.25,
-        "tone": "sert, soğukkanlı, acımasız derecede gerçekçi",
+        "desc": "Absürt ve komik. Mantıksız ama eğlenceli krizler (sadece bu modda).",
+        "temp": 1.05,
+        "swing": 1.40,
+        "tone": "yüksek tempo, absürt mizah, şaşırtıcı ve yaratıcı",
+        "require_reason": False,
+        "deceptive": False,
+        "antagonistic": False,
+        "turkey": False,
+        "absurd": True,
     },
 }
 
@@ -215,39 +487,51 @@ class GeminiLLM:
     def _init_backend(self) -> None:
         if not self.api_keys:
             self.backend = "none"
-            self.last_error = "API anahtarı bulunamadı."
+            self.last_error = "API key yok."
             return
 
+        # Try new SDK: google-genai
         try:
-            from google import genai as genai_sdk  # google-genai
-            self._client = genai_sdk.Client(api_key=self.api_keys[0])
+            from google import genai  # type: ignore
+            self._client = genai.Client(api_key=self.api_keys[0])
             self.backend = "genai"
+            self.model_in_use = "gemini-1.5-pro"
             return
         except Exception as e:
-            self.last_error = f"google-genai yüklenemedi: {type(e).__name__}: {e}"
+            self._client = None
+            self.last_error = f"google-genai yok/başarısız: {e}"
 
+        # Try legacy: google-generativeai
         try:
-            import google.generativeai as genai_legacy  # google-generativeai
+            import google.generativeai as genai_legacy  # type: ignore
             genai_legacy.configure(api_key=self.api_keys[0])
             self._legacy = genai_legacy
             self.backend = "legacy"
+            self.model_in_use = "gemini-1.5-pro"
             return
         except Exception as e:
-            self.last_error = f"google-generativeai yüklenemedi: {type(e).__name__}: {e}"
+            self._legacy = None
             self.backend = "none"
+            self.last_error = f"google-generativeai yok/başarısız: {e}"
 
     def status(self) -> LLMStatus:
         if self.backend == "none":
-            return LLMStatus(False, "none", "", self.last_error or "Gemini kapalı.")
-        return LLMStatus(True, self.backend, self.model_in_use or "", self.last_error or "")
+            return LLMStatus(False, "none", "", self.last_error)
+        return LLMStatus(True, self.backend, self.model_in_use, "")
 
     def _rotate_key(self) -> None:
         if len(self.api_keys) <= 1:
             return
         self.api_keys = self.api_keys[1:] + self.api_keys[:1]
+        # re-init with next key
         self._init_backend()
 
-    def generate_text(self, prompt: str, temperature: float, max_output_tokens: int) -> str:
+    def generate_text(self, prompt: str, temperature: float = 0.8, max_output_tokens: int = 1400) -> str:
+        """Generate text with key rotation + model fallback.
+
+        - Tries a small list of candidate Gemini model names.
+        - Rotates across all provided API keys if an error occurs.
+        """
         candidates = [
             "gemini-3-flash-preview",
             "gemini-2.5-flash",
@@ -256,144 +540,165 @@ class GeminiLLM:
             "gemini-1.5-pro",
         ]
 
+        last_err: Optional[Exception] = None
+
+        # Try each key (rotate on failure). For each key, try candidate models.
         for _ in range(max(1, len(self.api_keys))):
-            if self.backend == "genai":
-                try:
-                    for m in candidates:
-                        try:
-                            resp = self._client.models.generate_content(  # type: ignore
-                                model=m,
-                                contents=prompt,
-                                config={
-                                    "temperature": temperature,
-                                    "max_output_tokens": max_output_tokens,
-                                },
-                            )
-                            txt = getattr(resp, "text", None)
-                            if txt:
-                                self.model_in_use = m
-                                self.last_error = ""
-                                return str(txt)
-                        except Exception as e:
-                            self.last_error = f"{type(e).__name__}: {e}"
-                            continue
-                except Exception as e:
-                    self.last_error = f"{type(e).__name__}: {e}"
+            if self.backend == "genai" and self._client is not None:
+                for m in candidates:
+                    try:
+                        res = self._client.models.generate_content(
+                            model=m,
+                            contents=prompt,
+                            config={
+                                "temperature": float(temperature),
+                                "max_output_tokens": int(max_output_tokens),
+                            },
+                        )
+                        txt = getattr(res, "text", "") or ""
+                        if txt.strip():
+                            self.model_in_use = m
+                            return txt
+                    except Exception as e:
+                        last_err = e
+                        continue
 
-            if self.backend == "legacy":
-                try:
-                    for m in candidates:
-                        try:
-                            model = self._legacy.GenerativeModel(m)  # type: ignore
-                            resp = model.generate_content(
-                                prompt,
-                                generation_config={
-                                    "temperature": temperature,
-                                    "max_output_tokens": max_output_tokens,
-                                },
-                            )
-                            txt = getattr(resp, "text", None)
-                            if txt:
-                                self.model_in_use = m
-                                self.last_error = ""
-                                return str(txt)
-                        except Exception as e:
-                            self.last_error = f"{type(e).__name__}: {e}"
-                            continue
-                except Exception as e:
-                    self.last_error = f"{type(e).__name__}: {e}"
+            if self.backend == "legacy" and self._legacy is not None:
+                for m in candidates:
+                    try:
+                        model = self._legacy.GenerativeModel(m)
+                        res = model.generate_content(
+                            prompt,
+                            generation_config={
+                                "temperature": float(temperature),
+                                "max_output_tokens": int(max_output_tokens),
+                            },
+                        )
+                        txt = getattr(res, "text", "") or ""
+                        if txt.strip():
+                            self.model_in_use = m
+                            return txt
+                    except Exception as e:
+                        last_err = e
+                        continue
 
+            # rotate to next key and re-init backend
             self._rotate_key()
 
-        raise RuntimeError(self.last_error or "Gemini yanıt veremedi.")
+        raise RuntimeError(f"Gemini hata: {last_err}" if last_err else "Gemini yanıt veremedi.")
 
 
 # =========================
 # Offline generator (fallback)
 # =========================
 
-def get_case(case_key: str) -> CaseSeason:
-    for c in CASE_LIBRARY:
-        if c.key == case_key:
-            return c
-    return CASE_LIBRARY[0]
-
 def offline_month_bundle(seed: int, mode: str, month: int, idea: str, history: List[dict], case: CaseSeason) -> dict:
-    rng = random.Random(seed + month * 97 + (123 if mode == "Extreme" else 0))
+    rng = random.Random(seed + month * 97 + (123 if MODES.get(mode, {}).get("absurd") else 0))
+    idea = (idea or "").strip() or "Henüz fikrini netleştirmedin; herkes farklı bir şey anlıyor."
 
-    idea = (idea or "").strip()
-    if not idea:
-        idea = "Henüz fikrini netleştirmedin; herkes farklı bir şey anlıyor."
+    # Style knobs
+    is_turkey = MODES.get(mode, {}).get("turkey", False)
+    is_spartan = MODES.get(mode, {}).get("antagonistic", False)
+    is_absurd = MODES.get(mode, {}).get("absurd", False)
+
+    def pick(items: List[str]) -> str:
+        return rng.choice(items)
+
+    # Case flavored intro
+    case_hint = ""
+    if case.key != "free":
+        case_hint = f"Bu sezonun teması: {case.title} ({case.years}). {case.blurb}\n\n"
 
     if month == 1:
         durum = (
-            f"İlk ayın: fikrin büyük ama dağınık.\n\n"
+            f"{case_hint}"
+            f"İlk ay: fikrin büyük ama dağınık.\n\n"
             f"**Ürün fikri:** {idea}\n\n"
-            "İlk risk, 'anlaşılma' sorunu. İnsanlar seni duyuyor ama aynı şeyi hayal etmiyor. "
-            "Bu yüzden ekip bir yandan özellik eklemek isterken, diğer yandan kullanıcı ilk 60 saniyede kayboluyor.\n\n"
-            "Bu ayın görevi: tek bir sahneye kilitlenmek mi, yoksa iki akışlı bir yaklaşım mı kurmak?"
+            "İlk risk 'anlaşılma' sorunu. İnsanlar seni duyuyor ama aynı şeyi hayal etmiyor. "
+            "Bu ay hedefin: tek bir sahneye kilitlenip kanıt üretmek."
         )
     else:
         last = history[-1] if history else {}
         last_choice = last.get("choice", "?")
         last_title = last.get("choice_title", "bir karar")
         durum = (
+            f"{case_hint}"
             f"Ay {month}: geçen ay **{last_choice}** seçtin (*{last_title}*).\n\n"
-            "Şimdi ikinci dalga geliyor: seçimlerinin yan etkileri görünmeye başladı. "
-            "Kimi kullanıcı hız istiyor, kimi kontrol; ekip ise 'hepsini yapalım' ile 'odak' arasında bölünüyor.\n\n"
-            "Bu ay Durum Analizi, bir önceki kararın **neden işe yaradığı / yaramadığı** üzerine kurulu: "
-            "Süreçler mi büyüdü, yoksa hikâye mi netleşti?"
+            "Seçiminin yan etkileri görünmeye başladı. Ekip tempo isterken, müşteri güveni ve operasyon yükü de masada."
         )
 
-    kriz_hooks = [
-        "Bir rakip onboarding ekranını 'challenge' yapıyor; herkes 3 saniyede çıkıyor.",
-        "Kurumsal bir müşteri 'biz bunu kendi sürecimize uydururuz' diyerek ürünü Excel'e çevirmeye kalkıyor.",
-        "Topluluk ürünü bambaşka bir amaçla kullanıyor; sosyal medyada yanlış bir hikâye yayılıyor.",
-        "Bir influencer ürünü yanlış anlatıyor; support hattı 'bu böyle mi çalışmalı?' sorularıyla doluyor.",
-        "Sunucu maliyetleri patlıyor; aynı anda ilk büyük müşteri SLA istiyor.",
+    if is_turkey:
+        durum += "\n\nTürkiye gerçeği: kur/enflasyon oynuyor, tahsilat gecikmeleri artıyor, denetim riski konuşuluyor."
+
+    if is_spartan:
+        durum += "\n\nAnlatıcı: 'Bu ay hata payın yok. Kararını savunmak zorundasın.'"
+
+    if is_absurd:
+        durum += "\n\nEvren absürt: Gerçeklik ipleri gevşek. Ama yine de bir karar vermek zorundasın."
+
+    crisis_pool = [
+        "Bir müşteri segmenti beklenmedik şekilde şikâyet yağdırdı ve iade talep ediyor.",
+        "Yeni bir rakip, fiyat kırdı ve satış görüşmelerinin tonu değişti.",
+        "Ürünün kritik bir akışında hata oranı arttı; support kuyruğu şişti.",
+        "Bir iş ortağı 'kural değişikliği' sinyali verdi; görünürlük düşebilir.",
     ]
-    hook = rng.choice(kriz_hooks)
-
-    kriz = (
-        f"**Kriz:** {hook}\n\n"
-        "Sorun ürünün 'kötü' olması değil; ürünün **ne olduğuna dair hikâyenin kontrolünü** kaybetmen. "
-        "Herkes seni kendi ihtiyacına çevirirken, sen tek bir cevap veremezsen destek ve altyapı yükü üst üste binmeye başlar.\n\n"
-        "Bu ay bir karar vermelisin: ya tek bir vaade kilitlenip gürültüyü susturacaksın, "
-        "ya da kaosu yönetecek bir yapı kuracaksın."
-    )
-
-    a_title = rng.choice(["Tek vaat protokolü", "Tek sahne kuralı", "Tek cümle manifestosu"])
-    b_title = rng.choice(["Çift kulvar planı", "İki akış stratejisi", "Filtreli onboarding"])
-
-    a_steps = [
-        "Tek cümlelik değer önerisini yaz ve ekiple kilitle.",
-        "Onboarding'i 3 ekrana indir: giriş → tek görev → tek çıktı.",
-        "SSS'yi tek sayfa yap; en sık 6 soruya hazır cevap ekle.",
-        "Kurumsal talepleri 1 sayfalık kapsam notuna bağla; 'şimdilik hayır' cümlesini standartlaştır.",
-        "Destek taleplerini tek formda topla; etiketle ve haftalık triage yap.",
-    ]
-    b_steps = [
-        "Ürünü iki akışa ayır: hızlı kullanım / derin kullanım.",
-        "İlk ekranda tek soru sor: 'Hız mı, kontrol mü?' ve akışı ona göre aç.",
-        "Kurumsal için 'şablon rapor' paketi çıkar; özel istekleri sıraya al.",
-        "Yanlış beklentiyi azaltmak için ödeme/deneme ekranına net sınırlar ekle.",
-        "Support'u kategori bazlı ayır; 'yanlış kullanım' ile 'bug'ı ayrı kuyruğa al.",
-    ]
-
-    if mode == "Extreme":
-        durum += "\n\n*(Extreme ton)*: Her cümle bir PR bombası gibi. Yanlış bir kelime, yanlış bir kitleyi çağırır."
-        kriz += "\n\n*(Extreme ton)*: Bugün 'küçük bir yanlış anlaşılma', yarın şirketin yeni ürünü olur: **Excel eklentisi**."
-
-    note = ""
     if case.key != "free":
-        note = f"Vaka notu: Bu sezon **{case.title}** temasından esinlenir. ({case.inspired_by})"
+        # Add more legal/regulatory flavor
+        crisis_pool += [
+            "Basında şirketinle ilgili olumsuz bir iddia dolaşıyor; cevap vermen bekleniyor.",
+            "Uyum / sözleşme maddeleri masaya geldi; bazı müşteriler güvence istiyor.",
+        ]
+    if is_turkey:
+        crisis_pool += [
+            "Beklenmedik bir vergi/SGK ödeme planı gündeme geldi; nakit akışını sıkıştırıyor.",
+            "Denetim konuşuluyor; evrak ve süreçler sorgulanacak gibi.",
+            "Tedarik/lojistik maliyetleri bir anda arttı; fiyatları güncellemek zorundasın.",
+        ]
+    if is_absurd:
+        crisis_pool += [
+            "Bir kullanıcın hata logunu şiir zannedip viral etti; herkes 'bu bir sanat mı?' diye soruyor.",
+            "Bir uzay ajansı, ürününü yanlışlıkla sinyal protokolüne dahil etti; gece 03:00'te telefonlar susmuyor.",
+        ]
+
+    kriz = f"Kriz sahnesi: {pick(crisis_pool)}\n\n" \
+           "Bu ayın çatışması, bir şeyi düzeltirken başka bir şeyi feda etmek zorunda kalman."
+
+    # Offline choices
+    tags = ["growth","efficiency","reliability","compliance","fundraising","people","product","sales","marketing","security"]
+    tagA = pick(tags)
+    tagB = pick([t for t in tags if t != tagA])
+
+    def make_choice(letter: str, tag: str) -> Dict[str, Any]:
+        title_map = {
+            "growth":"Büyümeyi zorla",
+            "efficiency":"Maliyetleri kıs",
+            "reliability":"Stabilize et",
+            "compliance":"Uyumu güçlendir",
+            "fundraising":"Köprü finansman ara",
+            "people":"Ekip düzeni kur",
+            "product":"Ürünü sadeleştir",
+            "sales":"Satışı sıkıştır",
+            "marketing":"Hikâyeyi yeniden anlat",
+            "security":"Güvenliği sertleştir",
+        }
+        steps = [
+            "Hedefi tek cümleye indir ve ekipte ortak dil yarat.",
+            "En büyük riski belirle ve 72 saatlik bir plan çıkar.",
+            "Müşteriye/ekibe net iletişim kur: ne değişiyor, ne değişmiyor.",
+            "Bir metriğe değil, davranışa odaklı küçük deney yap ve öğren.",
+        ]
+        if is_turkey:
+            steps.append("Tahsilat, vergi ve sözleşme akışlarını aynı tabloda görünür kıl.")
+        if is_absurd:
+            steps.append("Absürt olanı avantaja çevir: hikâyeyi kontrol ederek yönlendir.")
+        return {"title": title_map.get(tag, f"Plan {letter}"), "steps": steps[:6], "tag": tag, "risk": pick(["low","med","high"]), "delayed_seed": "yan etki"}
 
     return {
         "durum_analizi": durum,
         "kriz": kriz,
-        "A": {"title": a_title, "steps": a_steps},
-        "B": {"title": b_title, "steps": b_steps},
-        "note": note,
+        "A": make_choice("A", tagA),
+        "B": make_choice("B", tagB),
+        "note": "Offline demo içerik (Gemini kapalı).",
     }
 
 
@@ -401,55 +706,110 @@ def offline_month_bundle(seed: int, mode: str, month: int, idea: str, history: L
 # Game state
 # =========================
 
-def default_stats(start_cash: int) -> dict:
+DEFAULT_EXPENSES = {"Salarlar": 50_000, "Sunucu": 6_100, "Pazarlama": 5_300}
+
+@dataclass
+class Archetype:
+    key: str
+    title: str
+    blurb: str
+    rep: float
+    support: float
+    infra: float
+    churn: float
+    cash_mult: float = 1.0
+
+ARCHETYPES: List[Archetype] = [
+    Archetype("tech", "Teknik Kurucu", "Altyapı güçlü, ama support hızla büyüyebilir.", 48, 22, 16, 0.050, 1.00),
+    Archetype("sales", "Satışçı Kurucu", "Gelir baskın, ama operasyon yükü ve churn riski artabilir.", 52, 25, 22, 0.060, 1.00),
+    Archetype("product", "Ürüncü Kurucu", "Kullanıcı deneyimi iyi; dengeli ilerler.", 55, 20, 20, 0.045, 1.00),
+    Archetype("ops", "Operasyoncu Kurucu", "Düzen ve verimlilik; büyüme yavaş ama sağlam.", 50, 18, 18, 0.050, 1.05),
+    Archetype("finance", "Finansçı Kurucu", "Runway odaklı; risk yönetimi güçlü.", 47, 22, 22, 0.055, 1.10),
+]
+
+def default_stats(start_cash: int, archetype: Archetype) -> dict:
     return {
         "cash": float(start_cash),
         "mrr": 0.0,
-        "reputation": 50.0,
-        "support_load": 20.0,
-        "infra_load": 20.0,
-        "churn": 0.05,
+        "reputation": float(archetype.rep),
+        "support_load": float(archetype.support),
+        "infra_load": float(archetype.infra),
+        "churn": float(archetype.churn),
     }
-
-DEFAULT_EXPENSES = {"Salarlar": 50_000, "Sunucu": 6_100, "Pazarlama": 5_300}
 
 def init_state() -> None:
     ss = st.session_state
     ss.setdefault("run_id", now_id())
     ss.setdefault("started", False)
+    ss.setdefault("ended", False)
+
     ss.setdefault("month", 1)
     ss.setdefault("season_length", 12)
-    ss.setdefault("mode", "Normal")
+
+    ss.setdefault("mode", "Gerçekçi")
     ss.setdefault("case_key", "free")
+
     ss.setdefault("founder_name", "İsimsiz Girişimci")
+    ss.setdefault("archetype_key", "product")
     ss.setdefault("startup_idea", "")
+
     ss.setdefault("start_cash", 1_000_000)
     ss.setdefault("expenses", DEFAULT_EXPENSES.copy())
-    ss.setdefault("stats", default_stats(ss["start_cash"]))
-    ss.setdefault("history", [])
-    ss.setdefault("months", {})
-    ss.setdefault("chat", [])
+
+    arch = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
+    ss.setdefault("stats", default_stats(int(ss["start_cash"] * arch.cash_mult), arch))
+
+    ss.setdefault("history", [])          # list of past month choices
+    ss.setdefault("months", {})           # month -> content bundle
+    ss.setdefault("chat", [])             # chat messages
+    ss.setdefault("delayed_queue", [])    # list of delayed effects dicts
+
+    ss.setdefault("pending_note", "")
+    ss.setdefault("pending_reason", "")
+    ss.setdefault("locked_settings", {})  # frozen snapshot when started
+
     ss.setdefault("llm_disabled", False)
     ss.setdefault("llm_last_error", "")
 
 def reset_game(keep_settings: bool = True) -> None:
     ss = st.session_state
-    keep = {}
+    keep: Dict[str, Any] = {}
     if keep_settings:
-        for k in ["season_length", "mode", "case_key", "founder_name", "startup_idea", "start_cash", "expenses"]:
+        for k in ["mode", "case_key", "season_length", "start_cash", "founder_name", "startup_idea", "archetype_key"]:
             keep[k] = ss.get(k)
-    ss.clear()
+
+    for k in list(ss.keys()):
+        del ss[k]
     init_state()
-    for k, v in keep.items():
-        ss[k] = v
-    ss["stats"] = default_stats(ss["start_cash"])
-    ss["chat"] = []
-    ss["history"] = []
-    ss["months"] = {}
-    ss["month"] = 1
-    ss["started"] = False
-    ss["llm_disabled"] = False
-    ss["llm_last_error"] = ""
+
+    if keep_settings:
+        for k, v in keep.items():
+            ss[k] = v
+
+    # reset stats from archetype & cash
+    arch = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
+    ss["stats"] = default_stats(int(ss["start_cash"] * arch.cash_mult), arch)
+
+def lock_settings() -> None:
+    ss = st.session_state
+    ss["locked_settings"] = {
+        "mode": ss["mode"],
+        "case_key": ss["case_key"],
+        "season_length": int(ss["season_length"]),
+        "start_cash": int(ss["start_cash"]),
+        "founder_name": ss["founder_name"],
+        "archetype_key": ss["archetype_key"],
+        "startup_idea": ss["startup_idea"],
+    }
+
+def is_locked() -> bool:
+    return bool(st.session_state.get("started"))
+
+def get_locked(k: str, default: Any = None) -> Any:
+    ss = st.session_state
+    if ss.get("started") and ss.get("locked_settings"):
+        return ss["locked_settings"].get(k, default)
+    return ss.get(k, default)
 
 
 # =========================
@@ -457,64 +817,105 @@ def reset_game(keep_settings: bool = True) -> None:
 # =========================
 
 def build_prompt(month: int, mode: str, idea: str, history: List[dict], case: CaseSeason, stats: dict) -> str:
-    tone = MODES.get(mode, MODES["Normal"])["tone"]
+    spec = MODES.get(mode, MODES["Gerçekçi"])
+    tone = spec["tone"]
+    is_turkey = bool(spec.get("turkey"))
+    is_absurd = bool(spec.get("absurd"))
+    deceptive = bool(spec.get("deceptive"))
+    antagonistic = bool(spec.get("antagonistic"))
+
     hist_lines = [
         f"- Ay {h.get('month')}: {h.get('choice')} / {h.get('choice_title')} | not: {h.get('note','-')}"
         for h in history[-4:]
     ]
     hist = "\n".join(hist_lines) if hist_lines else "(henüz seçim yok)"
 
+    # Background metrics for coherence ONLY (no mention in text)
     context_metrics = (
-        f"METRİKLER (sadece arka plan): cash={int(stats['cash'])}, mrr={int(stats['mrr'])}, "
+        f"ARKA PLAN (metin içinde yazma): cash={int(stats['cash'])}, mrr={int(stats['mrr'])}, "
         f"itibar={int(stats['reputation'])}/100, support={int(stats['support_load'])}/100, "
-        f"altyapı={int(stats['infra_load'])}/100, kayıp_oranı={stats['churn']:.3f}."
+        f"altyapı={int(stats['infra_load'])}/100, churn={stats['churn']:.3f}."
     )
 
     case_note = ""
     if case.key != "free":
         case_note = (
-            f"Sezon teması: {case.title}. Bu içerik '{case.inspired_by}' temasından esinlenebilir ama "
-            "olaylar oyunlaştırılmış ve basitleştirilmiş olmalı. "
-            "Şirket adı uydur (gerçek isim kullanma)."
+            f"TRUE STORY vaka teması: {case.title} ({case.years}). Esin: {case.inspired_by}.\n"
+            "Senaryo gerçek dinamiklerden esinlenir ama oyunlaştırılmıştır; olayları spoiler vermeden kurgula.\n"
+            "Şirket adı uydur (gerçek şirket adını metin içinde kullanma)."
         )
 
+    mode_rules = []
+    if is_turkey:
+        mode_rules.append("Türkiye bağlamı kullan: kur/enflasyon, vergi/SGK, denetim, tahsilat gecikmesi, afet riski, sözleşme pratikleri.")
+    if deceptive:
+        mode_rules.append("Seçenekler yanıltıcı olabilir: ikisi de mantıklı görünsün; ancak gizli risk/bedel barındırabilir. Bunları açıkça söyleme (spoiler yok).")
+    if antagonistic:
+        mode_rules.append("Anlatıcı antagonistik: baskı kur, iğneleyici ol ama hakaret etme. Mantık dışı ceza yok.")
+    if is_absurd:
+        mode_rules.append("Absürt ve komik krizler serbest; ama metin anlaşılır kalsın.")
+    if not is_absurd:
+        mode_rules.append("Mucize/absürt olay yasak. Tam gerçek dünya.")
+
+    mode_rules_text = "\n".join(f"- {x}" for x in mode_rules) if mode_rules else "- (ek kural yok)"
+
+    allowed_tags = "growth, efficiency, reliability, compliance, fundraising, people, product, sales, marketing, security"
+
     return f"""
-Sen bir startup RPG yazarı ve ürün stratejisti gibi yazıyorsun. Dil: Türkçe. Ton: {tone}.
-Amaç: oyuncuya "Durum Analizi" ve "Kriz" anlat, sonra iki seçenek sun (A/B). Seçeneklerde SONUÇ SPOILER'I YOK.
-Yani "bunu seçersen support artar" gibi şeyler yazma; sadece uygulanacak planı yaz.
+Sen bir startup simülasyonu için vaka yazarı ve ürün stratejisti gibi yazıyorsun. Dil: Türkçe.
+Ton: {tone}
+
+Amaç: Ay {month} için önce "Durum Analizi", sonra "Kriz" yaz, sonra iki seçenek sun (A/B).
+Seçeneklerde SONUÇ SPOILER'I YOK: metrik/sonuç isimleri yazma (kasa, MRR, churn vb. geçmesin).
+Sadece uygulanacak planı yaz.
 
 {case_note}
 
-Oyuncu adı: {st.session_state.get('founder_name','Girişimci')}
-Oyuncunun startup fikri (Ay 1 için ana kaynak): {idea or "(boş)"}
+MOD kuralları:
+{mode_rules_text}
 
-Geçmiş seçim özeti (Ay 2+ için analizde kullan):
+Oyuncu adı: {st.session_state.get('founder_name','Girişimci')}
+Oyuncunun startup fikri: {idea or "(boş)"}
+
+Geçmiş seçim özeti:
 {hist}
 
 {context_metrics}
 
-Şimdi Ay {month} için aşağıdaki JSON'u üret. ÇIKTI SADECE JSON olsun.
+Şimdi sadece aşağıdaki JSON'u üret (çıktı SADECE JSON olsun):
 
 Şema:
 {{
-  "durum_analizi": "2-4 paragraf. Ay 1 ise fikri detaylı analiz et. Ay 2+ ise son seçimlerin etkilerini analiz et.",
-  "kriz": "2-4 paragraf. Net ve somut kriz sahnesi. Rakam/metrik yazma.",
-  "A": {{"title": "kısa başlık", "steps": ["4-6 maddelik plan", "..."]}},
-  "B": {{"title": "kısa başlık", "steps": ["4-6 maddelik plan", "..."]}},
-  "note": "opsiyonel not"
+  "durum_analizi": "2-4 paragraf. Ay 1 ise fikri detaylı analiz et. Ay 2+ ise son seçimlerin yan etkilerini gerçekçi şekilde analiz et.",
+  "kriz": "2-4 paragraf. Net ve somut kriz sahnesi. Metrik isimleri/sonuç yazma.",
+  "A": {{
+    "title": "kısa başlık",
+    "steps": ["4-6 maddelik plan", "..."],
+    "tag": "{allowed_tags} içinden",
+    "risk": "low|med|high",
+    "delayed_seed": "1-6 kelime (gecikmeli yan etki tohumu)"
+  }},
+  "B": {{
+    "title": "kısa başlık",
+    "steps": ["4-6 maddelik plan", "..."],
+    "tag": "{allowed_tags} içinden",
+    "risk": "low|med|high",
+    "delayed_seed": "1-6 kelime (gecikmeli yan etki tohumu)"
+  }},
+  "note": "opsiyonel kısa not"
 }}
 
 Kurallar:
-- Seçenek planları birbirine yakın kalitede olsun.
-- Tek bir ayda tek sahne/tek çatışma.
-- 'kasa, MRR' gibi metrik isimlerini metin içine koyma.
+- A ve B birbirine yakın kalitede olsun; ikisi de mantıklı.
+- Tek bir ayda tek ana çatışma.
+- Metrik isimlerini metne koyma.
 """.strip()
 
 def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
     ss = st.session_state
-    mode = ss["mode"]
-    idea = ss["startup_idea"]
-    case = get_case(ss["case_key"])
+    mode = get_locked("mode", ss["mode"])
+    idea = get_locked("startup_idea", ss["startup_idea"])
+    case = get_case(get_locked("case_key", ss["case_key"]))
     stats = ss["stats"]
     history = ss["history"]
 
@@ -522,40 +923,42 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
         return offline_month_bundle(case.seed, mode, month, idea, history, case), "offline"
 
     prompt = build_prompt(month, mode, idea, history, case, stats)
-    temperature = MODES.get(mode, MODES["Normal"])["temp"]
+    temperature = float(MODES.get(mode, MODES["Gerçekçi"])["temp"])
+
     try:
-        raw = llm.generate_text(prompt, temperature=temperature, max_output_tokens=1600)
+        raw = llm.generate_text(prompt, temperature=temperature, max_output_tokens=1700)
         data = try_parse_json(raw)
         if not data:
             raise ValueError("JSON parse edilemedi.")
-
-        def norm_steps(x: Any) -> List[str]:
-            out = [str(s).strip() for s in ensure_list(x) if s is not None]
-            out = [s for s in out if s][:6]
-            return out
 
         bundle = {
             "durum_analizi": str(data.get("durum_analizi", "")).strip(),
             "kriz": str(data.get("kriz", "")).strip(),
             "A": {
                 "title": str((data.get("A") or {}).get("title", "Seçenek A")).strip(),
-                "steps": norm_steps((data.get("A") or {}).get("steps", [])),
+                "steps": normalize_steps((data.get("A") or {}).get("steps", [])),
+                "tag": normalize_tag((data.get("A") or {}).get("tag", "growth")),
+                "risk": normalize_risk((data.get("A") or {}).get("risk", "med")),
+                "delayed_seed": str((data.get("A") or {}).get("delayed_seed", "")).strip()[:60],
             },
             "B": {
                 "title": str((data.get("B") or {}).get("title", "Seçenek B")).strip(),
-                "steps": norm_steps((data.get("B") or {}).get("steps", [])),
+                "steps": normalize_steps((data.get("B") or {}).get("steps", [])),
+                "tag": normalize_tag((data.get("B") or {}).get("tag", "growth")),
+                "risk": normalize_risk((data.get("B") or {}).get("risk", "med")),
+                "delayed_seed": str((data.get("B") or {}).get("delayed_seed", "")).strip()[:60],
             },
-            "note": str(data.get("note", "") or "").strip(),
+            "note": str(data.get("note", "") or "").strip()[:240],
         }
 
+        # Minimal quality checks
         if len(bundle["A"]["steps"]) < 4 or len(bundle["B"]["steps"]) < 4:
             raise ValueError("Seçenek adımları çok kısa geldi.")
-
-        if len(bundle["durum_analizi"]) < 250 or len(bundle["kriz"]) < 250:
+        if len(bundle["durum_analizi"]) < 220 or len(bundle["kriz"]) < 220:
             off = offline_month_bundle(case.seed, mode, month, idea, history, case)
-            if len(bundle["durum_analizi"]) < 250:
+            if len(bundle["durum_analizi"]) < 220:
                 bundle["durum_analizi"] = off["durum_analizi"] + "\n\n---\n\n" + bundle["durum_analizi"]
-            if len(bundle["kriz"]) < 250:
+            if len(bundle["kriz"]) < 220:
                 bundle["kriz"] = off["kriz"] + "\n\n---\n\n" + bundle["kriz"]
 
         return bundle, "gemini"
@@ -569,60 +972,205 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
 # Game mechanics
 # =========================
 
-def apply_choice_effects(choice: str, month: int) -> dict:
+# Map tags to delta templates (these are "expected direction"; we add bounded noise)
+TEMPLATES: Dict[str, Dict[str, Tuple[float, float]]] = {
+    # (base, variance)
+    "growth":       {"cash": (-60_000, 55_000), "mrr": (1_200, 900), "reputation": (3, 4), "support_load": (9, 6), "infra_load": (9, 6), "churn": (0.010, 0.010)},
+    "efficiency":   {"cash": (40_000, 50_000),  "mrr": (-200, 350), "reputation": (-2, 4), "support_load": (-6, 6), "infra_load": (-6, 6), "churn": (0.004, 0.008)},
+    "reliability":  {"cash": (-55_000, 45_000), "mrr": (-150, 250), "reputation": (4, 4), "support_load": (-10, 7), "infra_load": (-10, 7), "churn": (-0.008, 0.010)},
+    "compliance":   {"cash": (-70_000, 55_000), "mrr": (-250, 250), "reputation": (6, 4), "support_load": (2, 4), "infra_load": (2, 4), "churn": (-0.004, 0.008)},
+    "fundraising":  {"cash": (180_000, 160_000),"mrr": (0, 200),    "reputation": (1, 5), "support_load": (3, 4), "infra_load": (3, 4), "churn": (0.000, 0.006)},
+    "people":       {"cash": (-45_000, 45_000), "mrr": (150, 250),  "reputation": (3, 4), "support_load": (-8, 7), "infra_load": (-5, 6), "churn": (-0.003, 0.008)},
+    "product":      {"cash": (-50_000, 45_000), "mrr": (700, 650),  "reputation": (3, 4), "support_load": (-3, 6), "infra_load": (2, 5), "churn": (-0.006, 0.010)},
+    "sales":        {"cash": (-25_000, 35_000), "mrr": (900, 850),  "reputation": (1, 4), "support_load": (4, 5), "infra_load": (3, 4), "churn": (0.006, 0.010)},
+    "marketing":    {"cash": (-45_000, 45_000), "mrr": (650, 650),  "reputation": (4, 4), "support_load": (2, 4), "infra_load": (2, 4), "churn": (-0.002, 0.009)},
+    "security":     {"cash": (-60_000, 50_000), "mrr": (-120, 250), "reputation": (5, 4), "support_load": (-6, 6), "infra_load": (-5, 6), "churn": (-0.006, 0.010)},
+}
+
+def rng_for(month: int, choice: str) -> random.Random:
     ss = st.session_state
-    mode = ss["mode"]
-    swing = MODES.get(mode, MODES["Normal"])["swing"]
-    case = get_case(ss["case_key"])
-
+    case = get_case(get_locked("case_key", ss["case_key"]))
     seed = hash((ss["run_id"], case.seed, month, choice)) & 0xFFFFFFFF
-    rng = random.Random(seed)
+    return random.Random(seed)
 
-    d = {
-        "cash": rng.uniform(-120_000, 180_000) * swing,
-        "mrr": rng.uniform(-500, 3_500) * swing,
-        "reputation": rng.uniform(-12, 14) * swing,
-        "support_load": rng.uniform(-10, 18) * swing,
-        "infra_load": rng.uniform(-10, 18) * swing,
-        "churn": rng.uniform(-0.020, 0.030) * swing,
-    }
-
-    if choice == "A":
-        d["reputation"] += rng.uniform(2, 10) * swing
-        d["support_load"] -= rng.uniform(2, 8) * swing
-        d["infra_load"] -= rng.uniform(0, 6) * swing
-        d["cash"] -= rng.uniform(20_000, 80_000) * swing
-        d["mrr"] += rng.uniform(-200, 1400) * swing
-    else:
-        d["support_load"] -= rng.uniform(0, 10) * swing
-        d["infra_load"] -= rng.uniform(0, 10) * swing
-        d["cash"] -= rng.uniform(40_000, 120_000) * swing
-        d["mrr"] += rng.uniform(200, 2200) * swing
-        d["reputation"] += rng.uniform(-6, 8) * swing
-
+def _sample_delta(tag: str, rng: random.Random, swing: float) -> Dict[str, float]:
+    tpl = TEMPLATES.get(tag, TEMPLATES["growth"])
+    d: Dict[str, float] = {}
+    for k, (base, var) in tpl.items():
+        # sample within [base-var, base+var]
+        val = rng.uniform(base - var, base + var) * swing
+        d[k] = float(val)
+    # clamp churn delta to reasonable bounds
     d["churn"] = clamp(d["churn"], -0.05, 0.08)
     return d
 
+def _mode_adjustments(d: Dict[str, float], rng: random.Random, mode: str) -> Dict[str, float]:
+    spec = MODES.get(mode, MODES["Gerçekçi"])
+    if spec.get("antagonistic"):
+        # Spartan: add negative drift
+        d["cash"] -= rng.uniform(10_000, 40_000) * spec["swing"]
+        d["churn"] += rng.uniform(0.002, 0.010) * spec["swing"]
+        d["reputation"] -= rng.uniform(0, 4) * spec["swing"]
+    if mode == "Zor":
+        # Slightly harsher volatility
+        if rng.random() < 0.35:
+            d["cash"] -= rng.uniform(5_000, 25_000) * spec["swing"]
+    return d
+
+def _case_bias(d: Dict[str, float], tag: str, month: int) -> Dict[str, float]:
+    # Simple per-case bias: compliance/security matters more in privacy case, etc.
+    ss = st.session_state
+    case_key = get_locked("case_key", ss["case_key"])
+    if case_key == "facebook_privacy_2019":
+        if tag in {"compliance","security"}:
+            d["reputation"] += 3.0
+            d["churn"] -= 0.004
+        if tag in {"growth","marketing"}:
+            d["reputation"] -= 2.0
+            d["churn"] += 0.004
+    if case_key == "blackberry_platform_shift":
+        if tag in {"product","growth","marketing"}:
+            d["mrr"] += 250
+        if tag == "reliability":
+            d["mrr"] -= 150  # quality alone doesn't move market fast
+    if case_key == "wework_ipo_2019":
+        if tag == "fundraising":
+            d["cash"] += 60_000
+            d["reputation"] -= 1.5
+        if tag == "efficiency":
+            d["reputation"] += 1.5
+    return d
+
+def schedule_delayed_effect(month: int, choice: str, tag: str, risk: str, seed_phrase: str) -> None:
+    ss = st.session_state
+    mode = get_locked("mode", ss["mode"])
+    spec = MODES.get(mode, MODES["Gerçekçi"])
+    rng = rng_for(month, choice)
+
+    p = {"low": 0.35, "med": 0.60, "high": 0.82}[risk]
+    if spec.get("antagonistic"):
+        p = min(0.95, p + 0.10)
+    if rng.random() > p:
+        return
+
+    due = month + (1 if rng.random() < 0.6 else 2)
+    # delayed tends to be more negative for risky growth/cuts
+    delayed_tag = tag
+    if tag == "efficiency":
+        delayed_tag = "people" if rng.random() < 0.5 else "reliability"
+    if tag == "growth":
+        delayed_tag = "reliability" if rng.random() < 0.4 else "growth"
+
+    base = _sample_delta(delayed_tag, rng, swing=0.55 * spec["swing"])
+    # Make delayed "lean negative"
+    base["cash"] -= abs(base["cash"]) * 0.25
+    base["reputation"] -= max(0.0, base["reputation"]) * 0.15
+    base["churn"] += abs(base["churn"]) * 0.35
+
+    ss["delayed_queue"].append({
+        "due_month": int(due),
+        "delta": base,
+        "hint": seed_phrase or "Gecikmeli etki",
+        "from_month": int(month),
+    })
+
+def apply_due_delays(month: int) -> List[Dict[str, Any]]:
+    ss = st.session_state
+    due = [x for x in ss.get("delayed_queue", []) if int(x.get("due_month", 0)) == int(month)]
+    if not due:
+        return []
+    ss["delayed_queue"] = [x for x in ss.get("delayed_queue", []) if int(x.get("due_month", 0)) != int(month)]
+    return due
+
+def turkey_macro_cost(month: int) -> float:
+    # Deterministic-ish macro pressure: increases with month
+    # We avoid mutating base expenses; this is "extra friction".
+    ss = st.session_state
+    case = get_case(get_locked("case_key", ss["case_key"]))
+    seed = hash((ss["run_id"], case.seed, "turkey_macro", month)) & 0xFFFFFFFF
+    rng = random.Random(seed)
+    inflation = 0.03 + (0.01 * (month / 6.0))  # grows over time
+    fx_shock = rng.uniform(-0.01, 0.05)
+    audit = 0.0
+    if rng.random() < 0.18:
+        audit = rng.uniform(15_000, 85_000)
+    disaster = 0.0
+    if rng.random() < 0.06:
+        disaster = rng.uniform(25_000, 160_000)
+    # return extra cost
+    return max(0.0, 0.0 + (inflation + fx_shock) * 40_000 + audit + disaster)
+
+def apply_delta_to_stats(stats: dict, delta: Dict[str, float]) -> None:
+    stats["cash"] = max(0.0, stats["cash"] + float(delta.get("cash", 0.0)))
+    stats["mrr"] = max(0.0, stats["mrr"] + float(delta.get("mrr", 0.0)))
+    stats["reputation"] = clamp(stats["reputation"] + float(delta.get("reputation", 0.0)), 0, 100)
+    stats["support_load"] = clamp(stats["support_load"] + float(delta.get("support_load", 0.0)), 0, 100)
+    stats["infra_load"] = clamp(stats["infra_load"] + float(delta.get("infra_load", 0.0)), 0, 100)
+    stats["churn"] = clamp(stats["churn"] + float(delta.get("churn", 0.0)), 0.0, 0.50)
+
 def step_month(choice: str) -> None:
     ss = st.session_state
-    month = ss["month"]
+    if ss.get("ended"):
+        return
+
+    month = int(ss["month"])
+    if any(h.get("month") == month for h in ss.get("history", [])):
+        ss["chat"].append({"role": "assistant", "kind": "warn", "content": f"🟨 Ay {month} için zaten seçim yaptın. Aynı ay tekrar işlenmez."})
+        return
+
     bundle = ss["months"].get(month)
     if not bundle:
         return
 
-    delta = apply_choice_effects(choice, month)
+    mode = get_locked("mode", ss["mode"])
+    spec = MODES.get(mode, MODES["Gerçekçi"])
     stats = ss["stats"]
 
-    total_exp = sum(ss["expenses"].values())
-    stats["cash"] = max(0.0, stats["cash"] - total_exp + delta["cash"])
-    stats["mrr"] = max(0.0, stats["mrr"] + delta["mrr"])
-    stats["reputation"] = clamp(stats["reputation"] + delta["reputation"], 0, 100)
-    stats["support_load"] = clamp(stats["support_load"] + delta["support_load"], 0, 100)
-    stats["infra_load"] = clamp(stats["infra_load"] + delta["infra_load"], 0, 100)
-    stats["churn"] = clamp(stats["churn"] + delta["churn"], 0.0, 0.50)
+    # Apply delayed effects due this month (before new choice)
+    due = apply_due_delays(month)
+    for ev in due:
+        apply_delta_to_stats(stats, ev.get("delta", {}))
+        ss["chat"].append({
+            "role": "assistant",
+            "kind": "note",
+            "content": f"⏳ **Gecikmeli etki (Ay {month})** — {ev.get('hint','Yan etki')} (Ay {ev.get('from_month','?')} kararının sonucu).",
+        })
 
-    choice_title = bundle[choice]["title"]
+    # Monthly expenses
+    total_exp = float(sum(ss["expenses"].values()))
+    macro_extra = 0.0
+    if spec.get("turkey"):
+        macro_extra = turkey_macro_cost(month)
+    stats["cash"] = max(0.0, stats["cash"] - total_exp - macro_extra)
+
+    # Immediate delta based on choice profile
+    choice_obj = bundle.get(choice, {})
+    tag = str(choice_obj.get("tag", "growth"))
+    risk = str(choice_obj.get("risk", "med"))
+    seed_phrase = str(choice_obj.get("delayed_seed", "")).strip()
+
+    rng = rng_for(month, choice)
+    swing = float(spec["swing"])
+    delta = _sample_delta(tag, rng, swing=swing)
+    delta = _mode_adjustments(delta, rng, mode)
+    delta = _case_bias(delta, tag, month)
+
+    apply_delta_to_stats(stats, delta)
+
+    # Schedule delayed effects
+    schedule_delayed_effect(month, choice, tag, risk, seed_phrase)
+
+    # Log to chat & history
+    choice_title = str(choice_obj.get("title", f"Seçenek {choice}")).strip()
+    note = (ss.get("pending_note") or "").strip()
+    reason = (ss.get("pending_reason") or "").strip()
+
     ss["chat"].append({"role": "user", "kind": "choice", "content": f"{choice} seçtim: **{choice_title}**"})
+    if reason:
+        ss["chat"].append({"role": "user", "kind": "note", "content": f"📝 Gerekçem: {reason}"})
+    if note:
+        ss["chat"].append({"role": "user", "kind": "note", "content": f"🗒️ Not: {note}"})
+
     result_lines = [
         f"- **Kasa:** {money(stats['cash'])}",
         f"- **MRR:** {money(stats['mrr'])}",
@@ -631,28 +1179,53 @@ def step_month(choice: str) -> None:
         f"- **Altyapı yükü:** {int(stats['infra_load'])}/100",
         f"- **Kayıp oranı:** {pct(stats['churn'])}",
     ]
+    if macro_extra > 0:
+        result_lines.append(f"- **Türkiye makro ek maliyet:** {money(macro_extra)}")
+
     ss["chat"].append({"role": "assistant", "kind": "result", "content": "✅ Seçimin işlendi. Güncel durum:\n\n" + "\n".join(result_lines)})
 
-    ss["history"].append({"month": month, "choice": choice, "choice_title": choice_title, "note": ss.get("free_note", "").strip(), "delta": delta})
-    ss["free_note"] = ""
+    ss["history"].append({
+        "month": month,
+        "choice": choice,
+        "choice_title": choice_title,
+        "note": note,
+        "reason": reason,
+        "tag": tag,
+        "risk": risk,
+        "delta": delta,
+    })
+    ss["pending_note"] = ""
+    ss["pending_reason"] = ""
 
-    if month < ss["season_length"]:
-        ss["month"] += 1
+    # Advance month / end season
+    if month < int(get_locked("season_length", ss["season_length"])):
+        ss["month"] = month + 1
     else:
-        ss["chat"].append({"role": "assistant", "kind": "end", "content": "🏁 Sezon bitti. İstersen oyunu sıfırlayıp başka bir mod veya vaka sezonu ile tekrar başlayabilirsin."})
+        ss["ended"] = True
+        ss["month"] = int(get_locked("season_length", ss["season_length"])) + 1
+        ss["chat"].append({"role": "assistant", "kind": "end", "content": "🏁 Sezon bitti. Özet aşağıda."})
+
+
+# =========================
+# Month preparation
+# =========================
 
 def ensure_month_ready(llm: GeminiLLM, month: int) -> None:
     ss = st.session_state
+    if ss.get("ended"):
+        return
     if month in ss["months"]:
         return
     bundle, source = generate_month_bundle(llm, month)
     ss["months"][month] = bundle
+
     ss["chat"].append({"role": "assistant", "kind": "analysis", "content": f"**🧩 Durum Analizi (Ay {month})**\n\n{bundle['durum_analizi']}"})
-    ss["chat"].append({"role": "assistant", "kind": "crisis", "content": f"**⚠️ Kriz**\n\n{bundle['kriz']}"})
+    ss["chat"].append({"role": "assistant", "kind": "crisis", "content": f"**⚠️ Kriz (Ay {month})**\n\n{bundle['kriz']}"})
     if bundle.get("note"):
         ss["chat"].append({"role": "assistant", "kind": "note", "content": f"🗂️ {bundle['note']}"})
+
     if source == "offline" and ss.get("llm_last_error"):
-        ss["chat"].append({"role": "assistant", "kind": "warn", "content": f"⚠️ **Gemini kapalı (offline demo)**: {ss['llm_last_error']}\n\nİstersen online için `google-genai` kurup tekrar deneyebilirsin."})
+        ss["chat"].append({"role": "assistant", "kind": "warn", "content": f"⚠️ **Gemini kapalı (offline)**: {ss['llm_last_error']}\n\nİstersen `google-genai` kurup tekrar dene."})
 
 
 # =========================
@@ -662,34 +1235,59 @@ def ensure_month_ready(llm: GeminiLLM, month: int) -> None:
 def render_sidebar(llm: GeminiLLM) -> None:
     ss = st.session_state
     stats = ss["stats"]
+    locked = is_locked()
 
-    st.sidebar.markdown(f"## 🧑‍💻 {ss['founder_name']}")
+    st.sidebar.markdown(f"## 🧑‍💻 {html_escape(get_locked('founder_name', ss['founder_name']))}")
     st.sidebar.markdown(f"<div class='muted smallcaps'>v{APP_VERSION}</div>", unsafe_allow_html=True)
 
+    # Mode
     st.sidebar.markdown("### Mod")
-    ss["mode"] = st.sidebar.selectbox("Mod", list(MODES.keys()), index=list(MODES.keys()).index(ss["mode"]), label_visibility="collapsed")
-    st.sidebar.caption(MODES[ss["mode"]]["desc"])
+    if not locked:
+        ss["mode"] = st.sidebar.selectbox("Mod", list(MODES.keys()), index=list(MODES.keys()).index(ss["mode"]), label_visibility="collapsed")
+        st.sidebar.caption(MODES[ss["mode"]]["desc"])
+    else:
+        st.sidebar.write(f"**{get_locked('mode')}**")
+        st.sidebar.caption(MODES[get_locked('mode')]["desc"])
 
-    st.sidebar.markdown("### Vaka sezonu (opsiyonel)")
+    # Case selection
+    st.sidebar.markdown("### Vaka sezonu")
     case_titles = [c.title for c in CASE_LIBRARY]
     cur_idx = next((i for i, c in enumerate(CASE_LIBRARY) if c.key == ss["case_key"]), 0)
-    chosen_title = st.sidebar.selectbox("Vaka", case_titles, index=cur_idx, label_visibility="collapsed")
-    chosen = next(c for c in CASE_LIBRARY if c.title == chosen_title)
-    ss["case_key"] = chosen.key
+    if not locked:
+        chosen_title = st.sidebar.selectbox("Vaka", case_titles, index=cur_idx, label_visibility="collapsed")
+        chosen = next(c for c in CASE_LIBRARY if c.title == chosen_title)
+        ss["case_key"] = chosen.key
+    else:
+        chosen = get_case(get_locked("case_key", ss["case_key"]))
+        st.sidebar.write(f"**{chosen.title}**")
     st.sidebar.caption(chosen.blurb)
 
+    if chosen.key != "free":
+        st.sidebar.markdown(f"<span class='pill ok'>True Story</span> <span class='pill'>{chosen.years}</span>", unsafe_allow_html=True)
+        with st.sidebar.expander("Kaynaklar (spoiler içerebilir)", expanded=False):
+            for t, url in chosen.sources:
+                st.markdown(f"- [{t}]({url})")
+
+    # Season length
     st.sidebar.markdown("### Sezon uzunluğu (ay)")
-    ss["season_length"] = int(st.sidebar.slider("Sezon uzunluğu (ay)", 6, 24, int(ss["season_length"]), 1))
-    st.sidebar.progress(min(1.0, ss["month"] / max(1, ss["season_length"])))
-    st.sidebar.caption(f"Ay: {ss['month']}/{ss['season_length']}")
-
-    st.sidebar.markdown("### Başlangıç kasası")
-    if not ss["started"]:
-        ss["start_cash"] = int(st.sidebar.slider("Başlangıç kasası", 50_000, 2_000_000, int(ss["start_cash"]), 50_000))
-        ss["stats"] = default_stats(ss["start_cash"])
+    if not locked:
+        ss["season_length"] = int(st.sidebar.slider("Sezon uzunluğu (ay)", 6, 24, int(ss["season_length"]), 1))
     else:
-        st.sidebar.write(money(stats["cash"]))
+        st.sidebar.write(f"**{get_locked('season_length')} ay**")
+    st.sidebar.progress(min(1.0, int(ss["month"]) / max(1, int(get_locked("season_length", ss["season_length"])))))
+    st.sidebar.caption(f"Ay: {int(ss['month'])}/{int(get_locked('season_length', ss['season_length']))}")
 
+    # Start cash
+    st.sidebar.markdown("### Başlangıç kasası")
+    if not locked:
+        ss["start_cash"] = int(st.sidebar.slider("Başlangıç kasası", 50_000, 2_000_000, int(ss["start_cash"]), 50_000))
+        # live preview of starting stats
+        arch = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
+        ss["stats"] = default_stats(int(ss["start_cash"] * arch.cash_mult), arch)
+    else:
+        st.sidebar.write(money(get_locked("start_cash", int(stats["cash"]))))
+
+    # Current financials
     st.sidebar.markdown("## Finansal Durum")
     st.sidebar.metric("Kasa", money(stats["cash"]))
     st.sidebar.metric("MRR", money(stats["mrr"]))
@@ -700,6 +1298,8 @@ def render_sidebar(llm: GeminiLLM) -> None:
             st.write(f"- {k}: {money(v)}")
             total += v
         st.write(f"**TOPLAM:** {money(total)}")
+        if MODES.get(get_locked("mode", ss["mode"]), {}).get("turkey") and locked:
+            st.caption("Türkiye modunda her ay ek makro maliyet doğabilir (enflasyon/kur/denetim/afet).")
 
     st.sidebar.markdown("---")
     st.sidebar.write(f"**İtibar:** {int(stats['reputation'])}/100")
@@ -718,8 +1318,9 @@ def render_sidebar(llm: GeminiLLM) -> None:
         st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
 
     if st.sidebar.button("Oyunu sıfırla", use_container_width=True):
-        reset_game(keep_settings=True)
+        reset_game(keep_settings=False)
         st.rerun()
+
 
 def render_header() -> None:
     c1, c2 = st.columns([0.72, 0.28])
@@ -727,34 +1328,138 @@ def render_header() -> None:
         st.markdown(f"# {APP_TITLE}")
         st.caption(APP_SUBTITLE)
     with c2:
-        with st.expander("🛠️ Karakterini ve ayarlarını özelleştir", expanded=False):
-            ss = st.session_state
-            ss["founder_name"] = st.text_input("Karakter adı", value=ss["founder_name"])
-            st.caption("Bu bölüm oyunun metnini etkiler (ileride daha da bağlarız).")
+        ss = st.session_state
+        if ss.get("started"):
+            arch = next((a for a in ARCHETYPES if a.key == get_locked("archetype_key", ss["archetype_key"])), ARCHETYPES[0])
+            with st.expander("🧑‍💻 Karakter (kilitli)", expanded=False):
+                st.write(f"**{get_locked('founder_name')}** — {arch.title}")
+                st.caption(arch.blurb)
+        else:
+            with st.expander("🧑‍💻 Karakterini seç (sezon başında kilitlenir)", expanded=True):
+                st.session_state["founder_name"] = st.text_input("Karakter adı", value=st.session_state.get("founder_name", "İsimsiz Girişimci"))
+                titles = [a.title for a in ARCHETYPES]
+                cur_idx = next((i for i,a in enumerate(ARCHETYPES) if a.key == ss.get("archetype_key")), 0)
+                pick_title = st.selectbox("Arketip", titles, index=cur_idx)
+                ss["archetype_key"] = next(a.key for a in ARCHETYPES if a.title == pick_title)
+
+                if st.button("🎲 Rastgele karakter", use_container_width=True):
+                    rng = random.Random(hash((ss["run_id"], "randchar")) & 0xFFFFFFFF)
+                    a = rng.choice(ARCHETYPES)
+                    ss["archetype_key"] = a.key
+                    names = ["Başar", "Deniz", "Ece", "Mert", "Zeynep", "Kerem", "Elif", "Cem", "İrem", "Can"]
+                    ss["founder_name"] = rng.choice(names) + " " + rng.choice(["Kaya", "Yılmaz", "Demir", "Aydın", "Şahin"])
+                    st.rerun()
+
 
 def render_start_screen() -> None:
     ss = st.session_state
     st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-    st.info("Oyuna başlamak için giriş fikrini yaz. Sonra Ay 1 başlar (Durum Analizi → Kriz → A/B).")
-    ss["startup_idea"] = st.text_area("Girişim fikrin ne?", value=ss["startup_idea"], height=140, placeholder="Örn: Anlık çeviri yapan bir uygulama...")
-    if ss.get("llm_disabled") and ss.get("llm_last_error"):
-        st.warning(f"Gemini kapalı: {ss['llm_last_error']}\n\nİstersen offline demo ile devam edebilirsin.")
-    start_disabled = not bool(ss["startup_idea"].strip())
-    if st.button("🚀 Oyunu Başlat", disabled=start_disabled, use_container_width=True):
+    st.info("Oyuna başlamak için girişim fikrini yaz. Sezon başladıktan sonra mod/vaka/para/karakter kilitlenir.")
+    ss["startup_idea"] = st.text_area(
+        "Girişim fikrin ne?",
+        value=ss["startup_idea"],
+        height=140,
+        placeholder="Örn: KOBİ'ler için otomatik fatura takibi + tahsilat hatırlatma...",
+    )
+
+    arch = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
+    st.markdown("### Başlangıç özeti")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.write(f"**Mod:** {ss['mode']}")
+        st.caption(MODES[ss["mode"]]["desc"])
+    with c2:
+        case = get_case(ss["case_key"])
+        st.write(f"**Vaka:** {case.title}")
+        if case.key != "free":
+            st.caption(f"True Story · {case.years}")
+        else:
+            st.caption(case.blurb)
+    with c3:
+        st.write(f"**Karakter:** {ss['founder_name']} — {arch.title}")
+        st.caption(arch.blurb)
+
+    if not ss["startup_idea"].strip():
+        st.warning("Başlamak için girişim fikrini yazmalısın.")
+        return
+
+    if st.button("🚀 Sezonu başlat", type="primary", use_container_width=True):
+        # Hard reset but keep chosen settings
+        reset_game(keep_settings=True)
         ss["started"] = True
+        ss["ended"] = False
         ss["month"] = 1
-        ss["chat"] = []
         ss["history"] = []
         ss["months"] = {}
+        ss["chat"] = []
+        ss["delayed_queue"] = []
         ss["llm_disabled"] = False
         ss["llm_last_error"] = ""
+
+        # lock settings and reset stats based on archetype
+        lock_settings()
+        arch2 = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
+        ss["stats"] = default_stats(int(ss["start_cash"] * arch2.cash_mult), arch2)
+
+        # Opening message
+        case = get_case(get_locked("case_key"))
+        intro = f"Sezon başladı. **{case.title}**"
+        if case.key != "free":
+            intro += f" · <span class='pill ok'>True Story</span> <span class='pill'>{case.years}</span>"
+        st.session_state["chat"].append({"role":"assistant","kind":"note","content":intro})
         st.rerun()
+
+
+def render_season_summary() -> None:
+    ss = st.session_state
+    stats = ss["stats"]
+    case = get_case(get_locked("case_key", ss["case_key"]))
+
+    st.markdown("## 🏁 Sezon Özeti")
+    st.write("Final durum:")
+    st.write(
+        f"- **Kasa:** {money(stats['cash'])}\n"
+        f"- **MRR:** {money(stats['mrr'])}\n"
+        f"- **İtibar:** {int(stats['reputation'])}/100\n"
+        f"- **Support yükü:** {int(stats['support_load'])}/100\n"
+        f"- **Altyapı yükü:** {int(stats['infra_load'])}/100\n"
+        f"- **Kayıp oranı:** {pct(stats['churn'])}"
+    )
+
+    with st.expander("Seçim geçmişi", expanded=False):
+        if not ss["history"]:
+            st.caption("Seçim yok.")
+        else:
+            for h in ss["history"]:
+                st.markdown(
+                    f"- Ay {h['month']}: **{h['choice']}** — {h['choice_title']} "
+                    f"(<span class='pill'>{tag_label(h.get('tag',''))}</span> "
+                    f"<span class='pill warn'>{risk_label(h.get('risk',''))}</span>)",
+                    unsafe_allow_html=True,
+                )
+                if h.get("reason"):
+                    st.caption(f"Gerekçe: {h['reason']}")
+                if h.get("note"):
+                    st.caption(f"Not: {h['note']}")
+
+    if case.key != "free":
+        with st.expander("Gerçekte ne oldu? (spoiler)", expanded=False):
+            for bullet in case.real_outcome:
+                st.markdown(f"- {bullet}")
+            st.markdown("**Kaynaklar:**")
+            for t, url in case.sources:
+                st.markdown(f"- [{t}]({url})")
 
 def render_chat_and_choices(llm: GeminiLLM) -> None:
     ss = st.session_state
-    month = ss["month"]
-    ensure_month_ready(llm, month)
+    month = int(ss["month"])
+    season_length = int(get_locked("season_length", ss["season_length"]))
 
+    # Prepare month content only if season ongoing
+    if not ss.get("ended") and month <= season_length:
+        ensure_month_ready(llm, month)
+
+    # Render chat log
     for msg in ss["chat"]:
         role = msg.get("role", "assistant")
         kind = msg.get("kind", "")
@@ -769,50 +1474,88 @@ def render_chat_and_choices(llm: GeminiLLM) -> None:
             avatar = "🟨"
         elif kind == "note":
             avatar = "🗂️"
+        elif kind == "end":
+            avatar = "🏁"
+
         with st.chat_message(role, avatar=avatar):
             st.markdown(msg.get("content", ""))
 
-    if month > ss["season_length"]:
+    # If season ended, show summary and stop
+    if ss.get("ended") or month > season_length:
+        render_season_summary()
         return
 
-    bundle = ss["months"][month]
+    bundle = ss["months"].get(month)
+    if not bundle:
+        return
 
-    with st.chat_message("assistant", avatar="👉"):
-        st.markdown("**Şimdi seçim zamanı. A mı B mi?** *(İstersen aşağıya kısa bir not da yazabilirsin.)*")
-        ss["free_note"] = st.text_input("Not (opsiyonel)", value=ss.get("free_note", ""), placeholder="Kısa not...", key=f"note_{month}")
+    mode = get_locked("mode", ss["mode"])
+    spec = MODES.get(mode, MODES["Gerçekçi"])
 
-        colA, colB = st.columns(2, gap="large")
-        with colA:
-            st.markdown("<div class='choice'>", unsafe_allow_html=True)
-            st.markdown(f"<div class='title'>A) {html_escape(bundle['A']['title'])}</div>", unsafe_allow_html=True)
-            st.markdown(md_escape_li(bundle["A"]["steps"]), unsafe_allow_html=True)
-            if st.button("A seç", key=f"A_{month}", use_container_width=True):
-                step_month("A")
+    st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+    st.subheader(f"Ay {month}: Kararını ver")
+
+    # Optional reason for Zor/Spartan
+    if spec.get("require_reason"):
+        ss["pending_reason"] = st.text_area(
+            "1–3 cümle: Bu ay neden bu kararı vereceksin? (Zor/Spartan modu)",
+            value=ss.get("pending_reason", ""),
+            height=80,
+            placeholder="Örn: Runway kısa, güveni koruyup riskli büyümeyi ertelemeliyim çünkü ...",
+        )
+
+    ss["pending_note"] = st.text_input("Opsiyonel not", value=ss.get("pending_note", ""), placeholder="Kendine not: ...")
+
+    cA, cB = st.columns(2, gap="large")
+
+    def render_choice(col, key: str) -> None:
+        obj = bundle.get(key, {})
+        title = html_escape(str(obj.get("title", f"Seçenek {key}")))
+        steps = obj.get("steps", [])
+        tag = str(obj.get("tag","growth"))
+        risk = str(obj.get("risk","med"))
+        with col:
+            st.markdown(
+                f"<div class='choice'><h4>{key}. {title}</h4>"
+                f"<span class='pill'>{tag_label(tag)}</span> "
+                f"<span class='pill warn'>{risk_label(risk)}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            for s in steps:
+                st.write(f"- {s}")
+
+            disabled = False
+            if spec.get("require_reason") and not (ss.get("pending_reason") or "").strip():
+                disabled = True
+
+            if st.button(f"{key} seç", key=f"btn_{month}_{key}", use_container_width=True, disabled=disabled):
+                if spec.get("require_reason") and not (ss.get("pending_reason") or "").strip():
+                    ss["chat"].append({"role":"assistant","kind":"warn","content":"🟨 Bu modda seçim yapmadan önce kısa bir gerekçe yazmalısın."})
+                    st.rerun()
+                step_month(key)
                 st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
 
-        with colB:
-            st.markdown("<div class='choice'>", unsafe_allow_html=True)
-            st.markdown(f"<div class='title'>B) {html_escape(bundle['B']['title'])}</div>", unsafe_allow_html=True)
-            st.markdown(md_escape_li(bundle["B"]["steps"]), unsafe_allow_html=True)
-            if st.button("B seç", key=f"B_{month}", use_container_width=True):
-                step_month("B")
-                st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
+    render_choice(cA, "A")
+    render_choice(cB, "B")
+
+
+def render_main(llm: GeminiLLM) -> None:
+    ss = st.session_state
+    render_header()
+
+    if not ss.get("started"):
+        render_start_screen()
+        return
+
+    render_chat_and_choices(llm)
+
 
 def main() -> None:
     init_state()
     llm = GeminiLLM.from_env_or_secrets()
     render_sidebar(llm)
-    render_header()
-
-    ss = st.session_state
-    if not ss["started"]:
-        render_start_screen()
-        return
-
-    st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
-    render_chat_and_choices(llm)
+    render_main(llm)
 
 if __name__ == "__main__":
     main()
