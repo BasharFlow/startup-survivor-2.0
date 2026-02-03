@@ -34,8 +34,8 @@ st.set_page_config(
 
 CSS = """
 <style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-section[data-testid="stSidebar"] .block-container {padding-top: 1.0rem;}
+.block-container {padding-top: 4.0rem; padding-bottom: 2rem;}
+section[data-testid="stSidebar"] .block-container {padding-top: 2.5rem;}
 .card {
   border: 1px solid rgba(255,255,255,0.08);
   border-radius: 16px;
@@ -1431,17 +1431,16 @@ def render_sidebar(llm: GeminiLLM) -> None:
         st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
 
     
-if ss.get("llm_disabled"):
-    if st.sidebar.button("Gemini'yi yeniden dene", use_container_width=True):
-        ss["llm_disabled"] = False
-        ss["llm_fail_count"] = 0
-        ss["llm_last_error"] = ""
-        st.rerun()
+    if ss.get("llm_disabled"):
+        if st.sidebar.button("Gemini\'yi yeniden dene", use_container_width=True):
+            ss["llm_disabled"] = False
+            ss["llm_fail_count"] = 0
+            ss["llm_last_error"] = ""
+            st.rerun()
 
-if st.sidebar.button("Oyunu sıfırla", use_container_width=True):
+    if st.sidebar.button("Oyunu sıfırla", use_container_width=True):
         reset_game(keep_settings=False)
         st.rerun()
-
 
 def render_header() -> None:
     c1, c2 = st.columns([0.72, 0.28])
