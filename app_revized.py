@@ -17,6 +17,41 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 
 
+# Structured-output JSON schema for month generation (used with google-genai).
+# Keeps Gemini responses machine-parseable and prevents "JSON parse edilemedi" issues.
+MONTH_RESPONSE_JSON_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "durum_analizi": {"type": "string"},
+        "kriz": {"type": "string"},
+        "A": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "tag": {"type": "string"},
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "risk": {"type": "string"},
+                "delayed_seed": {"type": "string"},
+            },
+            "required": ["title", "tag", "steps", "risk", "delayed_seed"],
+        },
+        "B": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "tag": {"type": "string"},
+                "steps": {"type": "array", "items": {"type": "string"}},
+                "risk": {"type": "string"},
+                "delayed_seed": {"type": "string"},
+            },
+            "required": ["title", "tag", "steps", "risk", "delayed_seed"],
+        },
+        "note": {"type": "string"},
+    },
+    "required": ["durum_analizi", "kriz", "A", "B", "note"],
+}
+
+
 # =========================
 # Config / Theme
 # =========================
@@ -548,8 +583,15 @@ class GeminiLLM:
         keys: List[str] = []
 
         def pull(name: str) -> Any:
-            if name in st.secrets:
-                return st.secrets.get(name)
+            # Streamlit secrets: top-level or nested tables (TOML sections)
+            try:
+                if name in st.secrets:
+                    return st.secrets.get(name)
+                for _, v in dict(st.secrets).items():
+                    if isinstance(v, dict) and name in v:
+                        return v.get(name)
+            except Exception:
+                pass
             return os.getenv(name)
 
         raw = pull("GEMINI_API_KEY")
@@ -708,6 +750,79 @@ def offline_month_bundle(seed: int, mode: str, month: int, idea: str, history: L
     is_turkey = MODES.get(mode, {}).get("turkey", False)
     is_spartan = MODES.get(mode, {}).get("antagonistic", False)
     is_absurd = MODES.get(mode, {}).get("absurd", False)
+
+    def generate_month_json(self, prompt: str, temperature: float = 0.8, max_output_tokens: int = 2000) -> Tuple[Optional[dict], str]:
+        """Generate a month bundle as JSON.
+
+        - With google-genai backend: uses structured output (response_mime_type + JSON schema) for reliable JSON.
+        - With legacy backend: falls back to best-effort parsing + one repair pass.
+        Returns (data_or_none, raw_text).
+        """
+        # Candidate models (first one is preferred)
+        candidates = [
+            "gemini-2.5-pro",
+            "gemini-2.5-pro-latest",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+        ]
+
+        if self.backend == "genai" and self._client is not None:
+            last_err = ""
+            for model in candidates:
+                # Try with current key; rotate on API errors (quota, auth, etc.)
+                for _ in range(max(1, len(self.api_keys))):
+                    try:
+                        resp = self._client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            config={
+                                "temperature": temperature,
+                                "max_output_tokens": max_output_tokens,
+                                "response_mime_type": "application/json",
+                                "response_json_schema": MONTH_RESPONSE_JSON_SCHEMA,
+                            },
+                        )
+                        raw = (getattr(resp, "text", "") or "").strip()
+                        # Should already be valid JSON, but keep a defensive parser.
+                        data = try_parse_json(raw) or json.loads(raw)
+                        self.model_in_use = model
+                        return data, raw
+                    except Exception as e:
+                        last_err = str(e)
+                        self.last_error = last_err
+                        # rotate to next key and re-init backend
+                        self._rotate_key()
+                        # refresh client if we have keys
+                        if self.backend != "genai":
+                            break
+                        continue
+            return None, (last_err or "")
+
+        # Legacy / none: use text generation + parse
+        raw = ""
+        try:
+            raw = self.generate_text(prompt, temperature=temperature, max_output_tokens=max_output_tokens)
+        except Exception as e:
+            self.last_error = str(e)
+            return None, raw
+
+        data = try_parse_json(raw)
+        if data:
+            return data, raw
+
+        # Repair once
+        try:
+            repaired = self.generate_text(build_json_repair_prompt(raw), temperature=0.1, max_output_tokens=max_output_tokens + 300)
+            data = try_parse_json(repaired)
+            if data:
+                return data, repaired
+        except Exception as e:
+            self.last_error = str(e)
+
+        return None, raw
+
+
 
     def pick(items: List[str]) -> str:
         return rng.choice(items)
@@ -1091,17 +1206,8 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
     temperature = float(MODES.get(mode, MODES["Gerçekçi"])["temp"])
 
     try:
-        raw = llm.generate_text(prompt, temperature=temperature, max_output_tokens=1700)
+        data, raw = llm.generate_month_json(prompt, temperature=temperature, max_output_tokens=2200)
         ss["llm_last_raw"] = (raw or "")[:8000]
-
-        data = try_parse_json(raw)
-
-        # If the model didn't return valid JSON, attempt a "JSON repair" pass once.
-        if not data:
-            repaired = llm.generate_text(build_json_repair_prompt(raw), temperature=0.1, max_output_tokens=2000)
-            ss["llm_last_raw_repaired"] = (repaired or "")[:8000]
-            data = try_parse_json(repaired)
-
         if not data:
             raise ValueError("JSON parse edilemedi.")
 
@@ -1495,6 +1601,8 @@ def render_sidebar(llm: GeminiLLM) -> None:
         st.sidebar.success("Gemini hazır (online).")
         if status.model:
             st.sidebar.caption(f"Model: {status.model}")
+        st.sidebar.caption(f"Anahtarlar: {len(llm.api_keys)}")
+        st.sidebar.caption(f"Backend: {status.backend}")
     else:
         msg = ss.get("llm_last_error") or status.note or "Gemini kapalı."
         st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
