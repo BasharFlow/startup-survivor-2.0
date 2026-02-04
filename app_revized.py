@@ -601,10 +601,24 @@ class GeminiLLM:
         if isinstance(raw, (list, tuple)):
             keys = [str(x) for x in raw]
         elif isinstance(raw, str) and raw.strip():
-            if "," in raw:
-                keys = [x.strip() for x in raw.split(",") if x.strip()]
-            else:
-                keys = [raw.strip()]
+            s = raw.strip()
+            # Streamlit secrets bazen listeyi string olarak gelebilir: '["k1","k2"]'
+            if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+                try:
+                    val = ast.literal_eval(s)
+                    if isinstance(val, (list, tuple)):
+                        keys = [str(x) for x in val if str(x).strip()]
+                    else:
+                        keys = [str(val).strip()]
+                except Exception:
+                    pass
+            if not keys:
+                if "\n" in s:
+                    keys = [x.strip() for x in s.splitlines() if x.strip()]
+                elif "," in s:
+                    keys = [x.strip() for x in s.split(",") if x.strip()]
+                else:
+                    keys = [s]
 
         return GeminiLLM(keys)
 
@@ -737,311 +751,110 @@ class GeminiLLM:
 
         raise RuntimeError(f"Gemini hata: {last_err}" if last_err else "Gemini yanıt veremedi.")
 
+    def generate_month_json(self, prompt: str, temperature: float = 0.8, max_output_tokens: int = 2200) -> Tuple[dict, str]:
+        """Gemini'den bu ayın içeriğini JSON olarak üretir.
 
-# =========================
-# Offline generator (fallback)
-# =========================
-
-def offline_month_bundle(seed: int, mode: str, month: int, idea: str, history: List[dict], case: CaseSeason) -> dict:
-    rng = random.Random(seed + month * 97 + (123 if MODES.get(mode, {}).get("absurd") else 0))
-    idea = (idea or "").strip() or "Henüz fikrini netleştirmedin; herkes farklı bir şey anlıyor."
-
-    # Style knobs
-    is_turkey = MODES.get(mode, {}).get("turkey", False)
-    is_spartan = MODES.get(mode, {}).get("antagonistic", False)
-    is_absurd = MODES.get(mode, {}).get("absurd", False)
-
-    def generate_month_json(self, prompt: str, temperature: float = 0.8, max_output_tokens: int = 2000) -> Tuple[Optional[dict], str]:
-        """Generate a month bundle as JSON.
-
-        - With google-genai backend: uses structured output (response_mime_type + JSON schema) for reliable JSON.
-        - With legacy backend: falls back to best-effort parsing + one repair pass.
-        Returns (data_or_none, raw_text).
+        - google-genai backend varsa structured output (response_mime_type + response_json_schema) ile JSON'u zorlar.
+        - legacy backend'de (google-generativeai) best-effort JSON üretir.
+        Döndürür: (data_dict, raw_text)
         """
-        # Candidate models (first one is preferred)
+
         candidates = [
             "gemini-2.5-pro",
-            "gemini-2.5-pro-latest",
             "gemini-2.5-flash",
             "gemini-2.0-flash",
             "gemini-1.5-pro",
         ]
 
-        if self.backend == "genai" and self._client is not None:
-            last_err = ""
-            for model in candidates:
-                # Try with current key; rotate on API errors (quota, auth, etc.)
-                for _ in range(max(1, len(self.api_keys))):
-                    try:
-                        resp = self._client.models.generate_content(
-                            model=model,
-                            contents=prompt,
-                            config={
-                                "temperature": temperature,
-                                "max_output_tokens": max_output_tokens,
-                                "response_mime_type": "application/json",
-                                "response_json_schema": MONTH_RESPONSE_JSON_SCHEMA,
-                            },
-                        )
-                        raw = (getattr(resp, "text", "") or "").strip()
-                        # Should already be valid JSON, but keep a defensive parser.
-                        data = try_parse_json(raw) or json.loads(raw)
-                        self.model_in_use = model
-                        return data, raw
-                    except Exception as e:
-                        last_err = str(e)
-                        self.last_error = last_err
-                        # rotate to next key and re-init backend
-                        self._rotate_key()
-                        # refresh client if we have keys
-                        if self.backend != "genai":
-                            break
-                        continue
-            return None, (last_err or "")
+        last_err: Optional[Exception] = None
+        last_raw: str = ""
 
-        # Legacy / none: use text generation + parse
-        raw = ""
-        try:
-            raw = self.generate_text(prompt, temperature=temperature, max_output_tokens=max_output_tokens)
-        except Exception as e:
-            self.last_error = str(e)
-            return None, raw
+        for m in candidates:
+            for _ in range(max(1, len(self.api_keys))):
+                try:
+                    if self.backend == "genai" and self._client is not None:
+                        try:
+                            resp = self._client.models.generate_content(
+                                model=m,
+                                contents=prompt,
+                                config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                    "response_mime_type": "application/json",
+                                    "response_json_schema": MONTH_RESPONSE_JSON_SCHEMA,
+                                },
+                            )
+                        except TypeError:
+                            resp = self._client.models.generate_content(
+                                model=m,
+                                contents=prompt,
+                                config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                    "response_mime_type": "application/json",
+                                },
+                            )
+                        last_raw = (getattr(resp, "text", "") or "").strip()
 
-        data = try_parse_json(raw)
-        if data:
-            return data, raw
+                    elif self.backend == "legacy" and self._legacy is not None:
+                        model = self._legacy.GenerativeModel(m)
+                        try:
+                            resp = model.generate_content(
+                                prompt,
+                                generation_config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                    "response_mime_type": "application/json",
+                                },
+                            )
+                        except Exception:
+                            resp = model.generate_content(
+                                prompt,
+                                generation_config={
+                                    "temperature": float(temperature),
+                                    "max_output_tokens": int(max_output_tokens),
+                                },
+                            )
+                        last_raw = (getattr(resp, "text", "") or "").strip()
 
-        # Repair once
-        try:
-            repaired = self.generate_text(build_json_repair_prompt(raw), temperature=0.1, max_output_tokens=max_output_tokens + 300)
-            data = try_parse_json(repaired)
-            if data:
+                    else:
+                        raise RuntimeError(self.last_error or "Gemini backend hazır değil.")
+
+                    if not last_raw:
+                        raise ValueError("Gemini boş yanıt döndürdü.")
+
+                    data = try_parse_json(last_raw)
+                    if data is None:
+                        data = json.loads(last_raw)
+
+                    self.model_in_use = m
+                    self.last_error = ""
+                    return data, last_raw
+
+                except Exception as e:
+                    last_err = e
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    self._rotate_key()
+                    continue
+
+        if last_raw.strip():
+            try:
+                repaired = self.generate_text(
+                    build_json_repair_prompt(last_raw),
+                    temperature=0.1,
+                    max_output_tokens=int(max_output_tokens) + 400,
+                ).strip()
+                data = try_parse_json(repaired)
+                if data is None:
+                    data = json.loads(repaired)
                 return data, repaired
-        except Exception as e:
-            self.last_error = str(e)
+            except Exception as e:
+                last_err = e
 
-        return None, raw
-
-
-
-    def pick(items: List[str]) -> str:
-        return rng.choice(items)
-
-    # Case flavored intro
-    case_hint = ""
-    if case.key != "free":
-        case_hint = f"Bu sezonun teması: {case.title} ({case.years}). {case.blurb}\n\n"
-
-    if month == 1:
-        durum = (
-            f"{case_hint}"
-            f"İlk ay: fikrin büyük ama dağınık.\n\n"
-            f"**Ürün fikri:** {idea}\n\n"
-            "İlk risk 'anlaşılma' sorunu. İnsanlar seni duyuyor ama aynı şeyi hayal etmiyor. "
-            "Bu ay hedefin: tek bir sahneye kilitlenip kanıt üretmek."
-        )
-    else:
-        last = history[-1] if history else {}
-        last_choice = last.get("choice", "?")
-        last_title = last.get("choice_title", "bir karar")
-        durum = (
-            f"{case_hint}"
-            f"Ay {month}: geçen ay **{last_choice}** seçtin (*{last_title}*).\n\n"
-            "Seçiminin yan etkileri görünmeye başladı. Ekip tempo isterken, müşteri güveni ve operasyon yükü de masada."
-        )
-
-    if is_turkey:
-        durum += "\n\nTürkiye gerçeği: kur/enflasyon oynuyor, tahsilat gecikmeleri artıyor, denetim riski konuşuluyor."
-
-    if is_spartan:
-        durum += "\n\nAnlatıcı: 'Bu ay hata payın yok. Kararını savunmak zorundasın.'"
-
-    if is_absurd:
-        durum += "\n\nEvren absürt: Gerçeklik ipleri gevşek. Ama yine de bir karar vermek zorundasın."
-
-    crisis_pool = [
-        "Bir müşteri segmenti beklenmedik şekilde şikâyet yağdırdı ve iade talep ediyor.",
-        "Yeni bir rakip, fiyat kırdı ve satış görüşmelerinin tonu değişti.",
-        "Ürünün kritik bir akışında hata oranı arttı; support kuyruğu şişti.",
-        "Bir iş ortağı 'kural değişikliği' sinyali verdi; görünürlük düşebilir.",
-    ]
-    if case.key != "free":
-        # Add more legal/regulatory flavor
-        crisis_pool += [
-            "Basında şirketinle ilgili olumsuz bir iddia dolaşıyor; cevap vermen bekleniyor.",
-            "Uyum / sözleşme maddeleri masaya geldi; bazı müşteriler güvence istiyor.",
-        ]
-    if is_turkey:
-        crisis_pool += [
-            "Beklenmedik bir vergi/SGK ödeme planı gündeme geldi; nakit akışını sıkıştırıyor.",
-            "Denetim konuşuluyor; evrak ve süreçler sorgulanacak gibi.",
-            "Tedarik/lojistik maliyetleri bir anda arttı; fiyatları güncellemek zorundasın.",
-        ]
-    if is_absurd:
-        crisis_pool += [
-            "Bir kullanıcın hata logunu şiir zannedip viral etti; herkes 'bu bir sanat mı?' diye soruyor.",
-            "Bir uzay ajansı, ürününü yanlışlıkla sinyal protokolüne dahil etti; gece 03:00'te telefonlar susmuyor.",
-        ]
-
-    kriz = f"Kriz sahnesi: {pick(crisis_pool)}\n\n" \
-           "Bu ayın çatışması, bir şeyi düzeltirken başka bir şeyi feda etmek zorunda kalman."
-
-    # Offline choices
-    tags = ["growth","efficiency","reliability","compliance","fundraising","people","product","sales","marketing","security"]
-    tagA = pick(tags)
-    tagB = pick([t for t in tags if t != tagA])
-
-    def make_choice(letter: str, tag: str) -> Dict[str, Any]:
-        title_map = {
-            "growth":"Büyümeyi zorla",
-            "efficiency":"Maliyetleri kıs",
-            "reliability":"Stabilize et",
-            "compliance":"Uyumu güçlendir",
-            "fundraising":"Köprü finansman ara",
-            "people":"Ekip düzeni kur",
-            "product":"Ürünü sadeleştir",
-            "sales":"Satışı sıkıştır",
-            "marketing":"Hikâyeyi yeniden anlat",
-            "security":"Güvenliği sertleştir",
-        }
-        steps = [
-            "Hedefi tek cümleye indir ve ekipte ortak dil yarat.",
-            "En büyük riski belirle ve 72 saatlik bir plan çıkar.",
-            "Müşteriye/ekibe net iletişim kur: ne değişiyor, ne değişmiyor.",
-            "Bir metriğe değil, davranışa odaklı küçük deney yap ve öğren.",
-        ]
-        if is_turkey:
-            steps.append("Tahsilat, vergi ve sözleşme akışlarını aynı tabloda görünür kıl.")
-        if is_absurd:
-            steps.append("Absürt olanı avantaja çevir: hikâyeyi kontrol ederek yönlendir.")
-        return {"title": title_map.get(tag, f"Plan {letter}"), "steps": steps[:6], "tag": tag, "risk": pick(["low","med","high"]), "delayed_seed": "yan etki"}
-
-    return {
-        "durum_analizi": durum,
-        "kriz": kriz,
-        "A": make_choice("A", tagA),
-        "B": make_choice("B", tagB),
-        "note": "Offline demo içerik (Gemini kapalı).",
-    }
+        raise RuntimeError(f"Gemini JSON üretemedi: {last_err}" if last_err else "Gemini JSON üretemedi.")
 
 
-# =========================
-# Game state
-# =========================
 
-DEFAULT_EXPENSES = {"Salarlar": 50_000, "Sunucu": 6_100, "Pazarlama": 5_300}
-
-@dataclass
-class Archetype:
-    key: str
-    title: str
-    blurb: str
-    rep: float
-    support: float
-    infra: float
-    churn: float
-    cash_mult: float = 1.0
-
-ARCHETYPES: List[Archetype] = [
-    Archetype("tech", "Teknik Kurucu", "Altyapı güçlü, ama support hızla büyüyebilir.", 48, 22, 16, 0.050, 1.00),
-    Archetype("sales", "Satışçı Kurucu", "Gelir baskın, ama operasyon yükü ve churn riski artabilir.", 52, 25, 22, 0.060, 1.00),
-    Archetype("product", "Ürüncü Kurucu", "Kullanıcı deneyimi iyi; dengeli ilerler.", 55, 20, 20, 0.045, 1.00),
-    Archetype("ops", "Operasyoncu Kurucu", "Düzen ve verimlilik; büyüme yavaş ama sağlam.", 50, 18, 18, 0.050, 1.05),
-    Archetype("finance", "Finansçı Kurucu", "Runway odaklı; risk yönetimi güçlü.", 47, 22, 22, 0.055, 1.10),
-]
-
-def default_stats(start_cash: int, archetype: Archetype) -> dict:
-    return {
-        "cash": float(start_cash),
-        "mrr": 0.0,
-        "reputation": float(archetype.rep),
-        "support_load": float(archetype.support),
-        "infra_load": float(archetype.infra),
-        "churn": float(archetype.churn),
-    }
-
-def init_state() -> None:
-    ss = st.session_state
-    ss.setdefault("run_id", now_id())
-    ss.setdefault("started", False)
-    ss.setdefault("ended", False)
-
-    ss.setdefault("month", 1)
-    ss.setdefault("season_length", 12)
-
-    ss.setdefault("mode", "Gerçekçi")
-    ss.setdefault("case_key", "free")
-
-    ss.setdefault("founder_name", "İsimsiz Girişimci")
-    ss.setdefault("archetype_key", "product")
-    ss.setdefault("startup_idea", "")
-
-    ss.setdefault("start_cash", 1_000_000)
-    ss.setdefault("expenses", DEFAULT_EXPENSES.copy())
-
-    arch = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
-    ss.setdefault("stats", default_stats(int(ss["start_cash"] * arch.cash_mult), arch))
-
-    ss.setdefault("history", [])          # list of past month choices
-    ss.setdefault("months", {})           # month -> content bundle
-    ss.setdefault("month_sources", {})    # month -> "gemini" | "offline"
-    ss.setdefault("chat", [])             # chat messages
-    ss.setdefault("delayed_queue", [])    # list of delayed effects dicts
-
-    ss.setdefault("pending_note", "")
-    ss.setdefault("pending_reason", "")
-    ss.setdefault("locked_settings", {})  # frozen snapshot when started
-
-    ss.setdefault("llm_disabled", False)
-    ss.setdefault("llm_fail_count", 0)
-    ss.setdefault("llm_last_error", "")
-    ss.setdefault("llm_last_raw", "")
-    ss.setdefault("llm_last_raw_repaired", "")
-
-def reset_game(keep_settings: bool = True) -> None:
-    ss = st.session_state
-    keep: Dict[str, Any] = {}
-    if keep_settings:
-        for k in ["mode", "case_key", "season_length", "start_cash", "founder_name", "startup_idea", "archetype_key"]:
-            keep[k] = ss.get(k)
-
-    for k in list(ss.keys()):
-        del ss[k]
-    init_state()
-
-    if keep_settings:
-        for k, v in keep.items():
-            ss[k] = v
-
-    # reset stats from archetype & cash
-    arch = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
-    ss["stats"] = default_stats(int(ss["start_cash"] * arch.cash_mult), arch)
-
-def lock_settings() -> None:
-    ss = st.session_state
-    ss["locked_settings"] = {
-        "mode": ss["mode"],
-        "case_key": ss["case_key"],
-        "season_length": int(ss["season_length"]),
-        "start_cash": int(ss["start_cash"]),
-        "founder_name": ss["founder_name"],
-        "archetype_key": ss["archetype_key"],
-        "startup_idea": ss["startup_idea"],
-    }
-
-def is_locked() -> bool:
-    return bool(st.session_state.get("started"))
-
-def get_locked(k: str, default: Any = None) -> Any:
-    ss = st.session_state
-    if ss.get("started") and ss.get("locked_settings"):
-        return ss["locked_settings"].get(k, default)
-    return ss.get(k, default)
-
-
-# =========================
-# Prompting (LLM)
-# =========================
 
 def build_prompt(month: int, mode: str, idea: str, history: List[dict], case: CaseSeason, stats: dict) -> str:
     spec = MODES.get(mode, MODES["Gerçekçi"])
@@ -1199,9 +1012,6 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
             st.caption("Onarım sonrası yanıt (kısaltılmış):")
             st.code(rep[:1500])
 
-    if ss.get("llm_disabled"):
-        return offline_month_bundle(case.seed, mode, month, idea, history, case), "offline"
-
     prompt = build_prompt(month, mode, idea, history, case, stats)
     temperature = float(MODES.get(mode, MODES["Gerçekçi"])["temp"])
 
@@ -1231,30 +1041,18 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
             "note": str(data.get("note", "") or "").strip()[:240],
         }
 
-        # Minimal quality checks (we can pad with offline snippets rather than hard-failing)
-        if len(bundle["A"]["steps"]) < 4 or len(bundle["B"]["steps"]) < 4:
-            raise ValueError("Seçenek adımları çok kısa geldi.")
-        if len(bundle["durum_analizi"]) < 220 or len(bundle["kriz"]) < 220:
-            off = offline_month_bundle(case.seed, mode, month, idea, history, case)
-            if len(bundle["durum_analizi"]) < 220:
-                bundle["durum_analizi"] = off["durum_analizi"] + "\n\n---\n\n" + bundle["durum_analizi"]
-            if len(bundle["kriz"]) < 220:
-                bundle["kriz"] = off["kriz"] + "\n\n---\n\n" + bundle["kriz"]
-
-        # Success -> reset fail counter and error
-        ss["llm_fail_count"] = 0
+        # Light sanity checks (offline fallback yok: mümkün olduğunca toleranslı)
+        bundle["A"]["steps"] = normalize_steps(bundle["A"]["steps"]) or ["Hızlı bir aksiyon planı çıkar ve 24 saat içinde uygula."]
+        bundle["B"]["steps"] = normalize_steps(bundle["B"]["steps"]) or ["Alternatif bir aksiyon planı çıkar ve 24 saat içinde uygula."]
+        bundle["durum_analizi"] = bundle["durum_analizi"] or "Bu ay belirsizlik yüksek; netleştirmek için ölçülebilir bir hedef belirle."
+        bundle["kriz"] = bundle["kriz"] or "Beklenmedik bir aksaklık çıktı; hızlı triage ve iletişim gerekiyor."
+        # Success -> clear error
         ss["llm_last_error"] = ""
-
         return bundle, "gemini"
     except Exception as e:
         ss["llm_last_error"] = f"{type(e).__name__}: {e}"
-        ss["llm_fail_count"] = int(ss.get("llm_fail_count", 0)) + 1
-
-        # Disable only after repeated failures (keeps Gemini usable if it's a one-off formatting glitch)
-        if ss["llm_fail_count"] >= 3:
-            ss["llm_disabled"] = True
-
-        return offline_month_bundle(case.seed, mode, month, idea, history, case), "offline"
+        # Gemini başarısız: offline fallback yok.
+        raise
 # =========================
 # Game mechanics
 # =========================
@@ -1503,17 +1301,13 @@ def ensure_month_ready(llm: GeminiLLM, month: int) -> None:
         return
     if month in ss["months"]:
         return
-    bundle, source = generate_month_bundle(llm, month)
+    bundle, _source = generate_month_bundle(llm, month)
     ss["months"][month] = bundle
-    ss["month_sources"][month] = source
 
     ss["chat"].append({"role": "assistant", "kind": "analysis", "content": f"**🧩 Durum Analizi (Ay {month})**\n\n{bundle['durum_analizi']}"})
     ss["chat"].append({"role": "assistant", "kind": "crisis", "content": f"**⚠️ Kriz (Ay {month})**\n\n{bundle['kriz']}"})
     if bundle.get("note"):
         ss["chat"].append({"role": "assistant", "kind": "note", "content": f"🗂️ {bundle['note']}"})
-
-    if source == "offline" and ss.get("llm_last_error"):
-        ss["chat"].append({"role": "assistant", "kind": "warn", "content": f"⚠️ **Gemini bu ay JSON formatında yanıt veremedi**: {ss['llm_last_error']}\n\nBu ay için offline içerik gösteriyorum. Sağ menüden **'Bu ayı Gemini ile yeniden üret'** ile tekrar deneyebilirsin."})
 
 
 # =========================
@@ -1597,7 +1391,7 @@ def render_sidebar(llm: GeminiLLM) -> None:
 
     st.sidebar.markdown("---")
     status = llm.status()
-    if status.ok and not ss.get("llm_disabled"):
+    if status.ok :
         st.sidebar.success("Gemini hazır (online).")
         if status.model:
             st.sidebar.caption(f"Model: {status.model}")
@@ -1605,28 +1399,7 @@ def render_sidebar(llm: GeminiLLM) -> None:
         st.sidebar.caption(f"Backend: {status.backend}")
     else:
         msg = ss.get("llm_last_error") or status.note or "Gemini kapalı."
-        st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
-
-    # Eğer bu ay offline üretildiyse (JSON format problemi), kullanıcı tek tıkla yeniden denesin.
-    cur_m = int(ss.get("month", 1))
-    if ss.get("started") and not ss.get("ended") and ss.get("month_sources", {}).get(cur_m) == "offline" and status.ok and not ss.get("llm_disabled"):
-        if st.sidebar.button("🔁 Bu ayı Gemini ile yeniden üret", use_container_width=True):
-            try:
-                if cur_m in ss.get("months", {}):
-                    del ss["months"][cur_m]
-                ss.get("month_sources", {}).pop(cur_m, None)
-            except Exception:
-                pass
-            ss["llm_last_error"] = ""
-            st.rerun()
-
-
-    if ss.get("llm_disabled"):
-        if st.sidebar.button("Gemini\'yi yeniden dene", use_container_width=True):
-            ss["llm_disabled"] = False
-            ss["llm_fail_count"] = 0
-            ss["llm_last_error"] = ""
-            st.rerun()
+        st.sidebar.error(f"Gemini hata: {msg[:180]}")
 
     if st.sidebar.button("Oyunu sıfırla", use_container_width=True):
         reset_game(keep_settings=False)
@@ -1661,7 +1434,7 @@ def render_header() -> None:
                     st.rerun()
 
 
-def render_start_screen() -> None:
+def render_start_screen(llm: GeminiLLM) -> None:
     ss = st.session_state
     st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
     st.info("Oyuna başlamak için girişim fikrini yaz. Sezon başladıktan sonra mod/vaka/para/karakter kilitlenir.")
@@ -1693,6 +1466,11 @@ def render_start_screen() -> None:
         st.warning("Başlamak için girişim fikrini yazmalısın.")
         return
 
+    status = llm.status()
+    if not status.ok:
+        st.error("Gemini hazır değil. Streamlit Secrets içine `GEMINI_API_KEY` (tek key veya liste) eklediğinden ve `google-genai` kurulu olduğundan emin ol.")
+        return
+
     if st.button("🚀 Sezonu başlat", type="primary", use_container_width=True):
         # Hard reset but keep chosen settings
         reset_game(keep_settings=True)
@@ -1703,9 +1481,7 @@ def render_start_screen() -> None:
         ss["months"] = {}
         ss["chat"] = []
         ss["delayed_queue"] = []
-        ss["llm_disabled"] = False
         ss["llm_last_error"] = ""
-
         # lock settings and reset stats based on archetype
         lock_settings()
         arch2 = next((a for a in ARCHETYPES if a.key == ss["archetype_key"]), ARCHETYPES[0])
@@ -1767,7 +1543,21 @@ def render_chat_and_choices(llm: GeminiLLM) -> None:
 
     # Prepare month content only if season ongoing
     if not ss.get("ended") and month <= season_length:
-        ensure_month_ready(llm, month)
+        try:
+            ensure_month_ready(llm, month)
+        except Exception as e:
+            err = ss.get("llm_last_error") or f"{type(e).__name__}: {e}"
+            st.error(f"Gemini içerik üretemedi. {err}")
+            with st.expander("🛠️ LLM Debug", expanded=True):
+                raw = ss.get("llm_last_raw", "")
+                rep = ss.get("llm_last_raw_repaired", "")
+                if raw:
+                    st.caption("Son ham yanıt (kısaltılmış):")
+                    st.code(raw[:4000])
+                if rep:
+                    st.caption("Onarım sonrası yanıt (kısaltılmış):")
+                    st.code(rep[:4000])
+            st.stop()
 
     # Render chat log
     for msg in ss["chat"]:
@@ -1855,7 +1645,7 @@ def render_main(llm: GeminiLLM) -> None:
     render_header()
 
     if not ss.get("started"):
-        render_start_screen()
+        render_start_screen(llm)
         return
 
     render_chat_and_choices(llm)
