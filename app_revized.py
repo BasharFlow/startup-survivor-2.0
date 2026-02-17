@@ -210,7 +210,7 @@ def try_parse_json(raw: str) -> Optional[dict]:
             s = s[i : j + 1]
 
     # Normalize common “smart quotes” coming from some models
-    s = (s or "").replace("“", """).replace("”", """).replace("’", "'").replace("‘", "'")
+    s = (s or "").replace("“", "\"").replace("”", "\"").replace("’", "'").replace("‘", "'")
 
     # Remove non-printable control chars (except whitespace)
     s = "".join(ch for ch in s if (ch >= " " or ch in "\n\r\t"))
@@ -759,16 +759,35 @@ class GeminiLLM:
                 # Try with current key; rotate on API errors (quota, auth, etc.)
                 for _ in range(max(1, len(self.api_keys))):
                     try:
-                        resp = self._client.models.generate_content(
-                            model=model,
-                            contents=prompt,
-                            config={
-                                "temperature": temperature,
-                                "max_output_tokens": max_output_tokens,
+                        cfg = {"temperature": temperature, "max_output_tokens": max_output_tokens}
+                        try:
+                            # Preferred: structured outputs (JSON mode + schema).
+                            cfg2 = dict(cfg)
+                            cfg2.update({
                                 "response_mime_type": "application/json",
                                 "response_json_schema": MONTH_RESPONSE_JSON_SCHEMA,
-                            },
-                        )
+                            })
+                            resp = self._client.models.generate_content(
+                                model=model,
+                                contents=prompt,
+                                config=cfg2,
+                            )
+                        except TypeError:
+                            # Older SDK versions may not support response_json_schema / response_mime_type.
+                            try:
+                                cfg3 = dict(cfg)
+                                cfg3.update({"response_mime_type": "application/json"})
+                                resp = self._client.models.generate_content(
+                                    model=model,
+                                    contents=prompt,
+                                    config=cfg3,
+                                )
+                            except TypeError:
+                                resp = self._client.models.generate_content(
+                                    model=model,
+                                    contents=prompt,
+                                    config=cfg,
+                                )
                         raw = (getattr(resp, "text", "") or "").strip()
                         # Should already be valid JSON, but keep a defensive parser.
                         data = try_parse_json(raw) or json.loads(raw)
@@ -1065,6 +1084,167 @@ BEKLENEN ŞEMA:
 DÖNÜŞTÜRÜLECEK METİN:
 {bad_output}
 """
+def offline_month_bundle(month: int, mode: str, idea: str, history: List[dict], case: CaseSeason) -> dict:
+    """Deterministic offline month generator.
+
+    Keeps the game playable when Gemini is unavailable (no API key, quota, network, SDK mismatch).
+    Metric-free narrative to preserve suspense (no 'cash/MRR/churn' words).
+    """
+    seed = hash((st.session_state.get("run_id",""), case.seed, "offline", month, mode)) & 0xFFFFFFFF
+    rng = random.Random(seed)
+
+    tags = ["growth","efficiency","reliability","compliance","fundraising","people","product","sales","marketing","security"]
+
+    tagA = rng.choice(tags)
+    tagB = rng.choice([t for t in tags if t != tagA])
+
+    def risk_for(tag: str) -> str:
+        base = {"fundraising":"med","compliance":"med","security":"med","reliability":"med",
+                "efficiency":"med","people":"med","product":"med","sales":"med","marketing":"med","growth":"high"}[tag]
+        if mode in {"Zor","Spartan"} and rng.random() < 0.45:
+            return "high"
+        if mode == "Gerçekçi" and rng.random() < 0.25:
+            return "low"
+        return base
+
+    step_bank = {
+        "growth": [
+            "Tek bir kanala odaklan: 2 hafta yoğun test, net hedef kitle ve teklif.",
+            "Hızlı bir landing + demo akışı kur; günlük geri bildirim topla.",
+            "Fiyat/packaging’i 1 değişkenle sadeleştir; satış konuşmasını standardize et.",
+            "Haftalık 5 müşteri görüşmesi; itiraz haritası çıkar.",
+            "Operasyonun kaldırabileceği kadar kapasite planı yap; aşırı söz verme.",
+        ],
+        "efficiency": [
+            "Giderleri kalem kalem denetle; ilk 3 kaçak noktayı kes.",
+            "Süreçleri yazılı hale getir; tekrarlayan işleri otomasyona taşı.",
+            "En pahalı 1-2 aracı alternatifle değiştir (risk analiziyle).",
+            "Performans ve öncelik matrisi: 'hemen' değil 'etkisi yüksek' işleri seç.",
+            "Kritik rolleri koru; rastgele kesinti yerine hedefli optimizasyon yap.",
+        ],
+        "reliability": [
+            "En çok sorun çıkaran modülü izleme/alert ile görünür yap.",
+            "Kritik akışlara test + rollback planı ekle.",
+            "Müşteri destek akışını triage ile düzene sok; SLA sözünü gerçekçi tut.",
+            "Teknik borç listesi çıkar; 2 haftalık 'stabilizasyon sprint'i planla.",
+            "Basit bir incident raporu rutini başlat: neden–ders–aksiyon.",
+        ],
+        "compliance": [
+            "Sözleşme/kvkk maddelerini avukatla gözden geçir; riskli vaadi kaldır.",
+            "Veri saklama ve erişim politikasını yaz; erişimleri daralt.",
+            "Şikâyet/denetim senaryosu için tek sayfalık 'playbook' hazırla.",
+            "Kritik kayıtları düzenle: log, onay, rıza, değişiklik izi.",
+            "Büyük müşteri için uyum doküman seti hazırla (kısa ve net).",
+        ],
+        "fundraising": [
+            "1 sayfalık hikâye + 8 slayt pitch iskeleti hazırla (problem–çözüm–kanıt).",
+            "Hedef yatırımcı listesi + tanıştırma zinciri çıkar; haftada 10 temas.",
+            "Due diligence klasörü: finans, sözleşmeler, ürün, roadmap.",
+            "Alternatif finansman: gelir paylaşımı, müşteri ön ödemesi, hibeler.",
+            "Görüşmeleri haftalık ritme bağla; takip e-postalarını sistemleştir.",
+        ],
+        "people": [
+            "Rolleri netleştir: kim neyden sorumlu, hangi çıktı haftalık ölçülür.",
+            "Tek bir kritik işe odaklı sprint planı; toplantıları %30 azalt.",
+            "Ekip içi gerilim varsa 'çatışma çözüm' oturumu ve karar kaydı yap.",
+            "İşe alım değilse: mevcut ekipte skill-gap kapatma planı çıkar.",
+            "Performans geri bildirimi: kısa, yazılı ve düzenli.",
+        ],
+        "product": [
+            "Kullanıcı yolculuğunda tek bir 'aha' anı seç; onu güçlendir.",
+            "En çok talep edilen 3 özelliği değil, en büyük problemi çözeni yap.",
+            "Onboarding’i kısalt; ilk değer anına giden adımları azalt.",
+            "Haftalık demo: değişiklikleri müşteriye göster, geri bildirim al.",
+            "Roadmap’i 4 haftaya indir; büyük vizyonu parçala.",
+        ],
+        "sales": [
+            "Outbound listesi: ICP’ye göre 100 hedef; günlük 10 temas.",
+            "Tek itiraz–tek cevap dokümanı çıkar; herkes aynı dili kullansın.",
+            "Satış hunisini görünür yap; her hafta bir darboğazı düzelt.",
+            "Demo şablonu + kapanış adımı standardize et (takvim linki, teklif paketi).",
+            "Referans iste: memnun 3 müşteriden 1 tanıştırma.",
+        ],
+        "marketing": [
+            "Bir ana mesaj seç; 3 içerik formatına dönüştür (post/video/mail).",
+            "Case study yaz: önce/sonra hikâyesi + somut süreç.",
+            "Topluluk/partner kanalı dene: 2 ortak webinar/etkinlik.",
+            "SEO için 5 anahtar kelime: niyet yüksek sayfalara odaklan.",
+            "Ölçüm altyapısı kur: UTM, dönüşüm olayı, haftalık rapor.",
+        ],
+        "security": [
+            "En kritik varlıkları listele; erişimleri minimuma indir.",
+            "MFA ve temel güvenlik hijyeni: ana hesaplar, paneller, repo.",
+            "Zafiyet taraması + hızlı yamalama takvimi oluştur.",
+            "Veri için şifreleme/backup kontrolü yap.",
+            "Olay müdahale planı: kim, neyi, ne zaman yapar?",
+        ],
+    }
+
+    hist = ""
+    if history:
+        last = history[-1]
+        hist = f'Son ay "{last.get("choice_title","")}" yönünde ilerledin; bunun yan etkileri bu ay masaya geliyor.'
+
+    case_line = ""
+    if case.key != "free":
+        case_line = f"Bu sezonun teması: {case.title} ({case.years}). Gerçek dinamiklerden esinlenen bir baskı katmanı var."
+
+    tr_line = ""
+    if mode == "Türkiye":
+        tr_line = "Türkiye gerçekleri: tahsilat gecikmesi, kur oynaklığı, denetim ve sözleşme pratikleri kararları sertleştiriyor."
+
+    durum = (
+        f"Ay {month}. {case_line}\n\n"
+        f"Girişim fikrin: {idea or '(boş)'}\n\n"
+        f"{hist} {tr_line}\n\n"
+        "Bu ay öncelik: tek bir kritik darboğazı seçip, diğer her şeyi bilinçli olarak ertelemek."
+    )
+
+    crisis_templates = [
+        "Büyük bir müşteri ‘kanıt’ istiyor: süreç, güven ve teslim tarihleri aynı anda masada.",
+        "Operasyonda bir çatlak büyüyor: küçük bir hata, zincirleme şikâyetleri tetikliyor.",
+        "Pazarda rakip agresifleşti: fiyat kırıyor ve müşterileri hızlıca ikna ediyor.",
+        "Ekip içinde karar yorgunluğu var: herkes farklı yöne çekiyor, hız düşüyor.",
+        "Beklenmedik bir dış baskı çıktı: uyum/denetim/tedarik tarafında dosya açıldı.",
+    ]
+    kriz = rng.choice(crisis_templates)
+    if mode == "Türkiye" and rng.random() < 0.6:
+        kriz += " Üstüne bir de tahsilat gecikmesi ve kur oynaklığı planları sıkıştırıyor."
+
+    kriz_text = (
+        f"{kriz}\n\n"
+        "Kriz tek bir noktada düğümleniyor: ya büyümeyi zorlayıp risk alacaksın ya da sistemi sağlamlaştırıp hızdan feragat edeceksin."
+    )
+
+    def make_option(tag: str, letter: str) -> dict:
+        steps = step_bank[tag][:]
+        rng.shuffle(steps)
+        steps = steps[:5]
+        title_map = {
+            "growth":"Büyüme Atağı", "efficiency":"Maliyet & Odak", "reliability":"Stabilizasyon", "compliance":"Uyum Kalkanı",
+            "fundraising":"Finansman Sprinti", "people":"Ekip Reset", "product":"Ürün Netleştirme", "sales":"Satış Baskısı",
+            "marketing":"Dağıtım Hamlesi", "security":"Güvenlik Sertleşmesi"
+        }
+        return {
+            "title": title_map.get(tag, f"Plan {letter}"),
+            "steps": steps,
+            "tag": tag,
+            "risk": risk_for(tag),
+            "delayed_seed": rng.choice([
+                "Beklenmeyen geri tepki", "İç direnç büyüyor", "Teknik borç faturası",
+                "Regülatör yakın takip", "Partner kırgınlığı", "Müşteri beklentisi şişiyor"
+            ]),
+        }
+
+    return {
+        "durum_analizi": durum.strip(),
+        "kriz": kriz_text.strip(),
+        "A": make_option(tagA, "A"),
+        "B": make_option(tagB, "B"),
+        "note": "Offline içerik üretimi (Gemini yok/başarısız). İstersen online olunca bu ayı yeniden üretebilirsin.",
+    }
+
+
 def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
     ss = st.session_state
     mode = get_locked("mode", ss["mode"])
@@ -1072,7 +1252,6 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
     case = get_case(get_locked("case_key", ss["case_key"]))
     stats = ss["stats"]
     history = ss["history"]
-
 
     with st.sidebar.expander("🛠️ LLM Debug", expanded=False):
         if ss.get("llm_last_error"):
@@ -1085,7 +1264,11 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
         if rep:
             st.caption("Onarım sonrası yanıt (kısaltılmış):")
             st.code(rep[:1500])
-    # Offline/demo modu kaldırıldı: Gemini başarısızsa hata veriyoruz.
+
+    status = llm.status()
+    if (not status.ok) or ss.get("llm_disabled"):
+        ss["llm_last_error"] = ss.get("llm_last_error") or (status.note or "Gemini kullanılamıyor.")
+        return offline_month_bundle(month, mode, idea, history, case), "offline"
 
     prompt = build_prompt(month, mode, idea, history, case, stats)
     temperature = float(MODES.get(mode, MODES["Gerçekçi"])["temp"])
@@ -1115,22 +1298,22 @@ def generate_month_bundle(llm: GeminiLLM, month: int) -> Tuple[dict, str]:
             },
             "note": str(data.get("note", "") or "").strip()[:240],
         }
-        # Minimal quality checks
+
         if len(bundle["A"]["steps"]) < 4 or len(bundle["B"]["steps"]) < 4:
             raise ValueError("Seçenek adımları çok kısa geldi.")
         if len(bundle["durum_analizi"]) < 220 or len(bundle["kriz"]) < 220:
             raise ValueError("Metin çok kısa geldi.")
 
-        # Success -> reset fail counter and error
         ss["llm_fail_count"] = 0
         ss["llm_last_error"] = ""
-
         return bundle, "gemini"
+
     except Exception as e:
         ss["llm_last_error"] = f"{type(e).__name__}: {e}"
         ss["llm_fail_count"] = int(ss.get("llm_fail_count", 0)) + 1
-        # Offline/demo modu yok: hatayı yukarı fırlat.
-        raise
+        if ss["llm_fail_count"] >= 2:
+            ss["llm_disabled"] = True
+        return offline_month_bundle(month, mode, idea, history, case), "offline"
 # =========================
 # Game mechanics
 # =========================
@@ -1484,7 +1667,7 @@ def render_sidebar(llm: GeminiLLM) -> None:
         st.sidebar.caption(f"Backend: {status.backend}")
     else:
         msg = ss.get("llm_last_error") or status.note or "Gemini erişilemiyor."
-        st.sidebar.warning(f"Gemini kapalı (offline). {msg[:140]}")
+        st.sidebar.warning(f"Gemini kullanılamıyor. Offline içerik üretimi devrede. {msg[:140]}")
 
     # Eğer bu ay offline üretildiyse (JSON format problemi), kullanıcı tek tıkla yeniden denesin.
     cur_m = int(ss.get("month", 1))
